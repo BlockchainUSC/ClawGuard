@@ -1,6 +1,6 @@
 package capability
 
-import "sort"
+import "slices"
 
 // ToolCategory groups concrete tools by the kind of access they grant. Profiles
 // are expressed in categories so that adding a tool does not mean revisiting
@@ -68,11 +68,12 @@ func (p Profile) AllowedCategories() []ToolCategory {
 	for c := range p.allowed {
 		out = append(out, c)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 
-func set(cats ...ToolCategory) map[ToolCategory]struct{} {
+// categorySet builds the lookup set for a profile's allowed categories.
+func categorySet(cats ...ToolCategory) map[ToolCategory]struct{} {
 	m := make(map[ToolCategory]struct{}, len(cats))
 	for _, c := range cats {
 		m[c] = struct{}{}
@@ -84,14 +85,14 @@ var profiles = map[Tier]Profile{
 	TierFull: {
 		tier:    TierFull,
 		name:    "Full / Unrestricted",
-		allowed: set(CatShell, CatSQLExec, CatSQLReadOnly, CatWebSearch, CatFileIO, CatStaticAPI),
+		allowed: categorySet(CatShell, CatSQLExec, CatSQLReadOnly, CatWebSearch, CatFileIO, CatStaticAPI),
 		model:   RoutePrimaryFull,
 	},
 	TierConstrained: {
 		tier:     TierConstrained,
 		name:     "Constrained",
 		readOnly: true,
-		allowed:  set(CatSQLReadOnly, CatWebSearch, CatStaticAPI),
+		allowed:  categorySet(CatSQLReadOnly, CatWebSearch, CatStaticAPI),
 		model:    RoutePrimaryStrict,
 	},
 	TierQuarantined: {

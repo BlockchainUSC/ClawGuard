@@ -93,3 +93,15 @@ func TestLoad_TrimsSurroundingWhitespace(t *testing.T) {
 		t.Errorf("AgentID = %q, want %q", got, "agent-1")
 	}
 }
+
+// A requirement set that names a variable this package does not know about is
+// a typo, and the one thing it must not do is quietly satisfy itself.
+func TestRequire_UnknownKeyIsReportedMissing(t *testing.T) {
+	err := loadFrom(fakeGetenv(fullEnv())).Require("POSTGRES_DNS")
+	if err == nil {
+		t.Fatal("an unrecognised variable name was accepted")
+	}
+	if !strings.Contains(err.Error(), "POSTGRES_DNS") {
+		t.Errorf("error %q does not name the unrecognised variable", err)
+	}
+}

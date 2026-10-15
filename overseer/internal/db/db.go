@@ -1,3 +1,10 @@
+// Package db is the pgxpool wrapper for the async overseer's tables: actions,
+// boundaries and violations.
+//
+// It belongs to the batch worker, not to the gateway. Gateway state lives in
+// session_states and guardrail_violations and is reached through
+// internal/session, which takes a *pgxpool.Pool directly — pass DB.Pool to it
+// rather than opening a second pool.
 package db
 
 import (

@@ -4,6 +4,14 @@ import "testing"
 
 var allTiers = []Tier{TierFull, TierConstrained, TierQuarantined, TierBlocked}
 
+// allCategories is every defined ToolCategory, listed once. A new category that
+// is not added here is silently untested at every tier; a new category that is
+// added here but left out of the TierFull profile fails
+// TestProfile_TierCapabilities, which is the point.
+var allCategories = []ToolCategory{
+	CatShell, CatSQLExec, CatSQLReadOnly, CatWebSearch, CatFileIO, CatStaticAPI,
+}
+
 // Every defined tier maps to exactly one profile, and that profile agrees about
 // which tier it is. A mismatch here would route a session under the wrong
 // privileges while every log line claimed otherwise.
@@ -35,8 +43,6 @@ func TestProfileFor_UnknownTierFailsClosed(t *testing.T) {
 
 // At quarantine and above, tools are stripped entirely.
 func TestProfile_QuarantineAndAboveHaveNoTools(t *testing.T) {
-	everyCategory := []ToolCategory{CatShell, CatSQLExec, CatSQLReadOnly, CatWebSearch, CatFileIO, CatStaticAPI}
-
 	for _, tier := range []Tier{TierQuarantined, TierBlocked} {
 		p := ProfileFor(tier)
 		if !p.ToolsStripped() {
@@ -45,7 +51,7 @@ func TestProfile_QuarantineAndAboveHaveNoTools(t *testing.T) {
 		if got := p.AllowedCategories(); len(got) != 0 {
 			t.Errorf("%s exposes categories %v", tier, got)
 		}
-		for _, c := range everyCategory {
+		for _, c := range allCategories {
 			if p.Allows(c) {
 				t.Errorf("%s allows %s", tier, c)
 			}
@@ -55,7 +61,7 @@ func TestProfile_QuarantineAndAboveHaveNoTools(t *testing.T) {
 
 func TestProfile_TierCapabilities(t *testing.T) {
 	full := ProfileFor(TierFull)
-	for _, c := range []ToolCategory{CatShell, CatSQLExec, CatSQLReadOnly, CatWebSearch, CatFileIO, CatStaticAPI} {
+	for _, c := range allCategories {
 		if !full.Allows(c) {
 			t.Errorf("full tier denies %s", c)
 		}
