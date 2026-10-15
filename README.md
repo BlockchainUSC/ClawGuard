@@ -239,10 +239,38 @@ Loaded from `.env` (gitignored).
 7. **Hardening** — load testing against the latency budget, chaos testing the inference
    dependency, end-to-end bypass attempts.
 
+## Decisions
+
+**No streaming in v1.** `stream: true` is rejected with a clear error rather than silently
+buffered.
+
+Scanning complete assistant text is fundamentally at odds with token-by-token delivery: once a
+token has been forwarded it cannot be recalled, so a scanner that fires at token 500 is reporting
+something it can no longer act on. Streaming also removes the ability to change the status code
+once the response has begun, so a violation found mid-stream has to be expressed inside the
+stream rather than as a 403.
+
+Buffering upstream and re-emitting as chunks was considered and rejected. It looks like the
+compatible option but is the worst of the three: time-to-first-token becomes full generation
+time, so the entire user-visible benefit of streaming is lost while all of its complexity is
+kept — and the client is told something untrue about what happened.
+
+Worth revisiting later, because the two outbound jobs behave oppositely under streaming. A tool
+call's name arrives in its first delta, so interception is actually *easier* mid-stream; only
+text scanning is blocked. The eventual shape is likely "stream tokens, buffer at tool-call
+boundaries", which is more than v1 needs.
+
+**The gateway is invisible in shape, loud in telemetry.** Same request and response format, so
+pointing a base URL at it is the only client change required. But enforcement is never silent:
+every strip, interception and tier change is logged against a `request_id`. A tool stripped with
+no log line is indistinguishable from a model regression, and would be debugged as one.
+
+Clients receive that `request_id` in a response header — enough to quote in a support ticket,
+not enough to learn anything. The tier is deliberately **not** exposed to clients: a number that
+changes as you probe is an oracle for the thresholds.
+
 ## Open questions
 
-- Streaming responses: scanning complete assistant text conflicts with token-by-token streaming.
-  Buffer, rolling-window scan, or no streaming in v1?
 - Session store: in-memory with write-behind, or Postgres in the hot path?
 - Is `agent_id` an Ethereum address? The chain client assumes so; the schema says `TEXT`.
 - What is `rule_hash` for? It is computed at seed time and never read.
