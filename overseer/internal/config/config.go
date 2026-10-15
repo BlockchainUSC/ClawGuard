@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -21,35 +22,82 @@ import (
 // Environment variable names. These are the strings reported back to the
 // operator when something is missing, so they are the single source of truth.
 const (
-	EnvPostgresDSN       = "POSTGRES_DSN"
-	EnvAgentID           = "AGENT_ID"
-	EnvOpenAIAPIKey      = "OPENAI_API_KEY"
-	EnvAlchemyRPCURL     = "ALCHEMY_RPC_URL"
-	EnvPrivateKey        = "PRIVATE_KEY"
-	EnvAuditLogAddress   = "AUDIT_LOG_ADDRESS"
-	EnvPunishmentAddress = "PUNISHMENT_ADDRESS"
-	EnvLlamaGuardURL     = "LLAMA_GUARD_URL"
+	EnvPostgresDSN      = "POSTGRES_DSN"
+	EnvListenAddr       = "LISTEN_ADDR"
+	EnvUpstreamBaseURL  = "UPSTREAM_BASE_URL"
+	EnvUpstreamAPIKey   = "UPSTREAM_API_KEY"
+	EnvToolRegistryPath = "TOOL_REGISTRY_PATH"
+	EnvJWTIssuer        = "JWT_ISSUER"
+	EnvJWTAudience      = "JWT_AUDIENCE"
+	EnvJWTPublicKeyPath = "JWT_PUBLIC_KEY_PATH"
+	EnvLlamaGuardURL    = "LLAMA_GUARD_URL"
+
+	// Durations are parsed rather than stored as strings, so they are absent
+	// from fields() and from the requirement sets: both have defaults.
+	EnvInspectTimeout  = "INSPECT_TIMEOUT"
+	EnvUpstreamTimeout = "UPSTREAM_TIMEOUT"
+)
+
+// Defaults.
+//
+// InspectTimeout is the budget for the whole inbound inspection phase, not per
+// inspector: every leg runs concurrently under one deadline. UpstreamTimeout is
+// far larger because a model writing a long answer is not a fault.
+const (
+	defaultListenAddr      = ":8080"
+	defaultInspectTimeout  = 2 * time.Second
+	defaultUpstreamTimeout = 5 * time.Minute
 )
 
 // Requirement sets per component. A process requires only what it actually
 // uses, so the gateway does not demand chain credentials it never touches.
+// RequiredForGateway is what the proxy needs to start.
+//
+// LLAMA_GUARD_URL is deliberately absent: phase 3 does not call the semantic
+// gate, and demanding a URL the process never uses means a pass-through proxy
+// refuses to boot for no reason. Phase 4 adds it to RequiredForInspection.
 var (
-	RequiredForSeeder   = []string{EnvPostgresDSN, EnvAgentID}
-	RequiredForGateway  = []string{EnvPostgresDSN, EnvLlamaGuardURL}
-	RequiredForChain    = []string{EnvAlchemyRPCURL, EnvPrivateKey, EnvAuditLogAddress, EnvPunishmentAddress}
-	RequiredForOverseer = []string{EnvPostgresDSN, EnvAgentID, EnvOpenAIAPIKey}
+	RequiredForGateway = []string{
+		EnvPostgresDSN,
+		EnvUpstreamBaseURL,
+		EnvToolRegistryPath,
+		EnvJWTIssuer,
+		EnvJWTAudience,
+		EnvJWTPublicKeyPath,
+	}
+
+	// RequiredForInspection is additionally required once the semantic gate is
+	// wired (phase 4).
+	RequiredForInspection = []string{EnvLlamaGuardURL}
+
+	RequiredForMigrate = []string{EnvPostgresDSN}
 )
 
 // Config holds every value this project reads from the environment.
 type Config struct {
-	PostgresDSN       string
-	AgentID           string
-	OpenAIAPIKey      string
-	AlchemyRPCURL     string
-	PrivateKey        string
-	AuditLogAddress   string
-	PunishmentAddress string
-	LlamaGuardURL     string
+	PostgresDSN string
+
+	// Gateway.
+	ListenAddr       string
+	UpstreamBaseURL  string
+	UpstreamAPIKey   string
+	ToolRegistryPath string
+
+	// Identity. The gateway verifies tokens with a public key, so it never
+	// holds the key that mints them.
+	JWTIssuer        string
+	JWTAudience      string
+	JWTPublicKeyPath string
+
+	// Inspection (phase 4).
+	LlamaGuardURL string
+
+	// Budgets. Separate on purpose: inspection must finish inside a tight
+	// deadline, while a model generating a long answer legitimately takes much
+	// longer. One shared timeout would either cut off generation or let a hung
+	// inspector hold the request open.
+	InspectTimeout  time.Duration
+	UpstreamTimeout time.Duration
 }
 
 // getenv is swappable so tests can supply an environment without mutating the
@@ -104,21 +152,34 @@ func loadDotEnv() {
 // absent is absent from both halves at once.
 func (c *Config) fields() map[string]*string {
 	return map[string]*string{
-		EnvPostgresDSN:       &c.PostgresDSN,
-		EnvAgentID:           &c.AgentID,
-		EnvOpenAIAPIKey:      &c.OpenAIAPIKey,
-		EnvAlchemyRPCURL:     &c.AlchemyRPCURL,
-		EnvPrivateKey:        &c.PrivateKey,
-		EnvAuditLogAddress:   &c.AuditLogAddress,
-		EnvPunishmentAddress: &c.PunishmentAddress,
-		EnvLlamaGuardURL:     &c.LlamaGuardURL,
+		EnvPostgresDSN:      &c.PostgresDSN,
+		EnvListenAddr:       &c.ListenAddr,
+		EnvUpstreamBaseURL:  &c.UpstreamBaseURL,
+		EnvUpstreamAPIKey:   &c.UpstreamAPIKey,
+		EnvToolRegistryPath: &c.ToolRegistryPath,
+		EnvJWTIssuer:        &c.JWTIssuer,
+		EnvJWTAudience:      &c.JWTAudience,
+		EnvJWTPublicKeyPath: &c.JWTPublicKeyPath,
+		EnvLlamaGuardURL:    &c.LlamaGuardURL,
 	}
 }
 
 func loadFrom(get getenv) Config {
-	var c Config
+	c := Config{
+		InspectTimeout:  defaultInspectTimeout,
+		UpstreamTimeout: defaultUpstreamTimeout,
+	}
 	for key, field := range c.fields() {
 		*field = strings.TrimSpace(get(key))
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(get(EnvInspectTimeout))); err == nil && d > 0 {
+		c.InspectTimeout = d
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(get(EnvUpstreamTimeout))); err == nil && d > 0 {
+		c.UpstreamTimeout = d
+	}
+	if c.ListenAddr == "" {
+		c.ListenAddr = defaultListenAddr
 	}
 	return c
 }

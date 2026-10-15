@@ -1,0 +1,11 @@
+{
+  "tools": {
+    "run_shell": "shell",
+    "sql_execute": "sql_exec",
+    "sql_select": "sql_readonly",
+    "web_search": "web_search",
+    "read_file": "file_io",
+    "write_file": "file_io",
+    "weather": "static_api"
+  }
+}
