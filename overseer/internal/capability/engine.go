@@ -23,7 +23,18 @@ type Decision struct {
 	To         Tier
 	RiskBefore int
 	RiskAfter  int
-	Reasons    []string
+
+	// SignalDelta is how much risk the signals in THIS evaluation added, with
+	// decay excluded.
+	//
+	// RiskAfter mixes two different things together: the decay that happened
+	// because time passed, and the risk these signals contributed. Storage
+	// needs to tell them apart. Decay must be applied once per unit of elapsed
+	// time; signal weight must be added once per evaluation. Folding them into
+	// one number means whoever saves it cannot apply each rule correctly.
+	SignalDelta int
+
+	Reasons []string
 }
 
 // Demoted reports whether this decision cost the session capability.
@@ -50,7 +61,7 @@ func (p Policy) Decide(cur Tier, score int, last time.Time, sigs []Signal, now t
 
 	if cur == TierBlocked {
 		d.To = TierBlocked
-		d.RiskAfter = clampScore(score)
+		d.RiskAfter = ClampScore(score)
 		d.Reasons = []string{"tier 3 is absorbing; no further evaluation"}
 		return d
 	}
@@ -61,7 +72,10 @@ func (p Policy) Decide(cur Tier, score int, last time.Time, sigs []Signal, now t
 	}
 
 	delta := 0
-	allLow := len(sigs) > 0
+	// False when there are no signals at all: with no new evidence there is
+	// nothing for the low-confidence cap to cap, and the session is judged on
+	// its decayed history alone.
+	onlyLowConfidence := len(sigs) > 0
 	for _, s := range sigs {
 		w := s.Weight
 		if w < 0 {
@@ -70,20 +84,21 @@ func (p Policy) Decide(cur Tier, score int, last time.Time, sigs []Signal, now t
 		}
 		delta += w
 		if s.Confidence != ConfidenceLow {
-			allLow = false
+			onlyLowConfidence = false
 		}
 		d.Reasons = append(d.Reasons, fmt.Sprintf("%s%s +%d", s.Source, codeSuffix(s.Code), w))
 	}
 
-	d.RiskAfter = clampScore(decayed + delta)
+	d.SignalDelta = delta
+	d.RiskAfter = ClampScore(decayed + delta)
 
 	candidate := p.Thresholds.TierFor(d.RiskAfter)
-	if allLow && candidate > TierConstrained {
+	if onlyLowConfidence && candidate > TierConstrained {
 		candidate = TierConstrained
 		d.Reasons = append(d.Reasons, "capped at constrained: all signals were low-confidence")
 	}
 
-	d.To = stricter(cur, candidate)
+	d.To = Stricter(cur, candidate)
 	if candidate < cur {
 		d.Reasons = append(d.Reasons,
 			fmt.Sprintf("ratchet held tier at %s (score alone justified %s)", cur, candidate))

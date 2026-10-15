@@ -95,6 +95,20 @@ internal packages import as `openclaw/oversight/overseer/internal/<pkg>` — not
 - `overseer/internal/config` — env loading with aggregated fail-fast validation. `Require` reports
   every missing variable at once, by name. Per-component requirement sets (`RequiredForGateway`,
   `RequiredForChain`, …) so a process only demands what it uses.
+- `overseer/internal/auth` — JWT verification. The parser pins algorithms, requires `exp`, and
+  checks issuer and audience. `User.Verified` records whether the gateway checked a signature
+  itself; it travels into the audit trail and is **not** stored on the session, because it
+  describes the request's credential rather than the session.
+- `overseer/internal/session` — `session_states` and `guardrail_violations`. Two invariants to
+  preserve: a session id is **not** authorisation (`loadByID` compares `user_id`, returning
+  `ErrSessionNotOwned`, which callers must render identically to "not found" so the endpoint is
+  not a session-id oracle); and risk is stored as **decay recomputed under the row lock plus
+  `Decision.SignalDelta`**, never as one combined delta — decay applies once per elapsed period,
+  signal weight once per evaluation, and conflating them let concurrent requests drain risk to
+  zero.
+- `overseer/internal/dbtest` — throwaway-schema harness. `dbtest.Pool(t)` creates an isolated
+  schema, applies the migration and drops it on cleanup. Finds `.env` by walking up from the
+  package directory.
 - `overseer/internal/db` — pgxpool wrapper. The intended cycle is
   `GetUnevaluatedActions` → `GetActiveBoundaries` → `InsertViolation` → `MarkEvaluated`.
   Actions are polled 50 at a time, oldest first. `Payload` is kept as raw JSONB bytes and passed
@@ -142,9 +156,9 @@ Carried in `README.md` under "Open questions" — streaming vs. output scanning,
 placement, whether `agent_id` is an Ethereum address, and the unused `rule_hash`. The tool-name to
 capability-category mapping is also unspecified. Raise these rather than silently picking one.
 
-A SQL schema for session and risk state was described as attached but did not arrive (the attached
-file was a duplicate of the architecture diagram). The tables in `schema.sql` cover only the async
-auditor. Ask for it before designing those tables from scratch.
+Resolved since: the session/risk schema arrived and is built as `session_states` and
+`guardrail_violations` in `migrations/0001_init.sql`. Session identity is server-issued JWT
+(`internal/auth`), with risk carried forward by `user_id` over a 24-hour window.
 
 ## Known inconsistency to resolve
 

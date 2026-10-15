@@ -83,17 +83,23 @@ func Decay(score int, last, now time.Time, halfLife time.Duration) int {
 		return 0
 	}
 	if halfLife <= 0 {
-		return clampScore(score)
+		return ClampScore(score)
 	}
 	elapsed := now.Sub(last)
 	if elapsed <= 0 {
-		return clampScore(score)
+		return ClampScore(score)
 	}
 	factor := math.Pow(0.5, elapsed.Seconds()/halfLife.Seconds())
-	return clampScore(int(math.Round(float64(score) * factor)))
+	return ClampScore(int(math.Round(float64(score) * factor)))
 }
 
-func clampScore(v int) int {
+// ClampScore holds a risk score inside [0, MaxRiskScore].
+//
+// Exported because the bound is a storage invariant as well as an arithmetic
+// one: the risk_score CHECK constraint in migrations/0001_init.sql rejects
+// anything outside the same range, so a caller that recomputes a score before
+// writing it must clamp it the same way this package does.
+func ClampScore(v int) int {
 	if v < 0 {
 		return 0
 	}

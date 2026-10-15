@@ -26,6 +26,8 @@ const (
 	TierBlocked Tier = 3
 )
 
+// MinTier and MaxTier bound the defined range. Anything outside it is not a
+// tier, and Valid, ParseTier and ProfileFor all treat it as blocked.
 const (
 	MinTier = TierFull
 	MaxTier = TierBlocked
@@ -61,9 +63,15 @@ func ParseTier(v int) (Tier, error) {
 	return t, nil
 }
 
-// stricter returns the more restrictive of two tiers. It is the ratchet
+// Stricter returns the more restrictive of two tiers. It is the ratchet
 // primitive: capability may be taken away, never handed back.
-func stricter(a, b Tier) Tier {
+//
+// Exported because the ratchet has to be re-applied anywhere a tier is
+// combined with another — Policy.Decide folds a score-derived candidate into
+// the current tier, and a store that writes a decision against a row it has
+// locked must fold the decision into whatever that row now holds. Both are the
+// same rule, and it is a security rule, so there is only one copy of it.
+func Stricter(a, b Tier) Tier {
 	if a > b {
 		return a
 	}

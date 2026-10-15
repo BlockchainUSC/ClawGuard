@@ -4,8 +4,9 @@ A guardrail gateway for LLM agents. It sits in front of an agent runtime as a re
 inspects traffic in both directions, and enforces a **capability profile** that can be demoted
 mid-session when risk signals fire. Violations are recorded in Postgres and anchored on-chain.
 
-> **Status:** early. The async audit/enforcement components exist; the gateway does not yet.
-> Each section below is marked **[built]**, **[partial]**, or **[planned]**.
+> **Status:** the security model, session storage and identity verification are built and
+> tested. The HTTP gateway that would call them does not exist yet, so none of it is on a
+> request path. Each section below is marked **[built]**, **[partial]**, or **[planned]**.
 
 ---
 
@@ -77,11 +78,11 @@ Two services, deliberately separate:
 | Mode | Synchronous, in the request path | Batch worker |
 | Budget | Milliseconds | Seconds to minutes |
 | Job | Inspect, demote, splice tools, block | Deep evaluation, on-chain anchoring |
-| Status | **[planned]** | **[partial]** |
+| Status | **[partial]** — model built, no HTTP layer | **[partial]** |
 
 ---
 
-## Capability profiles **[planned]**
+## Capability profiles **[built]**
 
 Execution capability is a **tier**, not a boolean. A session starts at a configured level and is
 demoted when risk signals fire. Every request is served under the session's current profile.
@@ -150,14 +151,22 @@ outbound layer is the backstop, not a duplicate:
 
 ## Data model
 
-**[built]** `boundaries`, `violations` — see `schema.sql`.
+**[built]** `migrations/0001_init.sql` is the source of truth and is idempotent. It holds
+`session_states` (per-session tier and cumulative risk) and `guardrail_violations` (the
+append-only compliance log), plus the inherited `actions`, `boundaries` and `violations`.
+`schema.sql` is superseded and kept only until the `actions` shape is settled.
 
-**[planned]** Session and risk state. The gateway needs at minimum: per-session capability level
-and risk score, an append-only log of risk events (which layer fired, score delta, taxonomy
-category), and a record of intercepted tool calls. A canonical schema for these is still to be
-agreed — the tables in `schema.sql` today cover only the async auditor.
+Enumerated columns carry CHECK constraints deliberately, including a `downgrade_is_ratchet`
+constraint that enforces the capability ratchet in the database as well as in Go, and a format
+check on `content_sha256`. `updated_at` is maintained by a `BEFORE UPDATE` trigger, because
+`DEFAULT NOW()` fires only on insert.
 
-`actions` is **owned by another team** and appears in `schema.sql` for reference only.
+`guardrail_violations` stores a hash plus a redacted preview as the durable record;
+`raw_content` is nullable and subject to a retention window.
+
+There is **no migration runner yet**. The single migration is idempotent by construction, which
+stops being achievable as soon as an `ALTER` is needed — see the hand-written guard around the
+`content_sha256` constraint for what that already costs.
 
 ---
 
@@ -165,12 +174,17 @@ agreed — the tables in `schema.sql` today cover only the async auditor.
 
 | Path | Status | Notes |
 |---|---|---|
-| `overseer/cmd/overseer` | **[stub]** | Prints a banner; the poll loop is not wired |
+| `overseer/internal/capability` | **[built]** | Tiers, profiles, tool registry, risk decay, the ratchet. Pure, no I/O |
+| `overseer/internal/auth` | **[built]** | JWT verification. Pinned algorithms, required expiry, issuer/audience checks |
+| `overseer/internal/session` | **[built]** | Session load/create with cross-session carry-forward; transactional decision writes |
+| `overseer/internal/config` | **[built]** | Env loading with aggregated fail-fast validation |
+| `overseer/internal/dbtest` | **[built]** | Throwaway-schema harness for database tests |
 | `overseer/cmd/seed` | **[built]** | Seeds `boundaries` for `$AGENT_ID`; idempotent |
 | `overseer/internal/db` | **[built]** | pgxpool wrapper; four queries |
 | `overseer/internal/evaluator` | **[built]** | gpt-4o-mini via langchaingo — async tail only |
 | `overseer/internal/chain` | **[built]** | Audit-log and punishment contract writes |
-| Gateway, heuristics, risk engine, tool splicer | **[planned]** | Not started |
+| `overseer/cmd/overseer` | **[stub]** | Prints a banner; the poll loop is not wired |
+| Gateway, heuristics, tool splicer | **[planned]** | Not started. Nothing above is on a request path yet |
 
 ---
 
@@ -181,7 +195,7 @@ go build ./...
 go vet ./...
 go run ./overseer/cmd/seed       # seed boundaries
 go run ./overseer/cmd/overseer   # currently a stub
-psql "$POSTGRES_DSN" -f schema.sql
+psql "$POSTGRES_DSN" -f migrations/0001_init.sql
 ```
 
 ### Environment
@@ -195,17 +209,19 @@ Loaded from `.env` (gitignored).
 | `ALCHEMY_RPC_URL`, `PRIVATE_KEY` | chain client |
 | `AUDIT_LOG_ADDRESS`, `PUNISHMENT_ADDRESS` | chain client |
 | `LLAMA_GUARD_URL` *(planned)* | semantic gate |
+| `TEST_POSTGRES_DSN` | database tests; they **skip silently** without it |
+| `REQUIRE_DB_TESTS` | set to any value to turn those skips into failures |
 
 ---
 
 ## Roadmap
 
-1. **Async tail** — wire the overseer loop; fix the severity mismatch; transactional
-   insert-and-mark; write `tx_hash` back; wait for receipts.
-2. **Gateway skeleton** — reverse proxy that forwards upstream unmodified, with session loading
-   and pass-through logging. Correct plumbing before any enforcement.
-3. **Capability engine** — the level table, session state, the demotion ratchet, risk scoring.
-   Pure and unit-testable, with no I/O.
+1. ~~**Capability engine** — the level table, the demotion ratchet, risk scoring and decay.
+   Pure and unit-testable, with no I/O.~~ **Done.**
+2. ~~**Identity and session storage** — JWT verification, session load/create with
+   cross-session carry-forward, transactional decision writes under a row lock.~~ **Done.**
+3. **Gateway skeleton** — reverse proxy that forwards upstream unmodified, with session loading
+   and pass-through logging. Correct plumbing before any enforcement. **Next.**
 4. **Inbound inspection** — fast heuristics, then the Llama Guard 3 client with concurrent
    fan-out, a timeout, and fail-closed demotion.
 5. **Tool splicing** — tool-to-category registry, request rewriting, model routing per level,
