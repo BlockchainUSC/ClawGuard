@@ -1,8 +1,8 @@
-# OpenClaw Onchain Overseer
+# OpenClaw Guard
 
 A guardrail gateway for LLM agents. It sits in front of an agent runtime as a reverse proxy,
 inspects traffic in both directions, and enforces a **capability profile** that can be demoted
-mid-session when risk signals fire. Violations are recorded in Postgres and anchored on-chain.
+mid-session when risk signals fire. Every decision and its evidence are recorded in Postgres.
 
 > **Status:** the security model, session storage and identity verification are built and
 > tested. The HTTP gateway that would call them does not exist yet, so none of it is on a
@@ -64,23 +64,16 @@ mid-session when risk signals fire. Violations are recorded in Postgres and anch
                                |
                                v
                +------------------------------+
-               | Audit Logger (Async Worker)  | ---> Postgres + chain
+               | Audit Logger (Async Worker)  | ---> Postgres
                +---------------+--------------+
                                |
                                v
                         Response to User
 ```
 
-Two services, deliberately separate:
-
-| | Gateway | Overseer (async) |
-|---|---|---|
-| Mode | Synchronous, in the request path | Batch worker |
-| Budget | Milliseconds | Seconds to minutes |
-| Job | Inspect, demote, splice tools, block | Deep evaluation, on-chain anchoring |
-| Status | **[partial]** — model built, no HTTP layer | **[partial]** |
-
----
+One service. An earlier design had a second, asynchronous worker that evaluated actions with an
+LLM and anchored violations to a blockchain; it was inherited from the multi-team project this was
+forked from, and `0002_drop_async_tail.sql` removed it. See that migration for the reasoning.
 
 ## Capability profiles **[built]**
 
@@ -153,8 +146,8 @@ outbound layer is the backstop, not a duplicate:
    intercepted here.
 2. **Output scan** — Llama Guard 3 over the generated assistant text before it returns to the
    client.
-3. **Audit logging** — asynchronous; writes violations, prompts, and risk diffs to Postgres and
-   anchors them on-chain.
+3. **Audit logging** — asynchronous; writes violations, previews and risk diffs to Postgres
+   without blocking the response.
 
 ---
 
@@ -183,16 +176,14 @@ stops being achievable as soon as an `ALTER` is needed — see the hand-written 
 
 | Path | Status | Notes |
 |---|---|---|
-| `overseer/internal/capability` | **[built]** | Tiers, profiles, tool registry, risk decay, the ratchet. Pure, no I/O |
-| `overseer/internal/auth` | **[built]** | JWT verification. Pinned algorithms, required expiry, issuer/audience checks |
-| `overseer/internal/session` | **[built]** | Session load/create with cross-session carry-forward; transactional decision writes |
+| `overseer/internal/capability` | **[built]** | Tiers, profiles, tool registry, risk scoring and decay, the ratchet. Pure, no I/O |
+| `overseer/internal/auth` | **[built]** | JWT verification. Pinned algorithms, required expiry, issuer and audience checked |
+| `overseer/internal/session` | **[built]** | Session load/create with cross-session carry-forward; transactional decision writes under a row lock |
+| `overseer/internal/migrate` | **[built]** | Migration runner; refuses to re-run an edited migration |
 | `overseer/internal/config` | **[built]** | Env loading with aggregated fail-fast validation |
 | `overseer/internal/dbtest` | **[built]** | Throwaway-schema harness for database tests |
-| `overseer/cmd/seed` | **[built]** | Seeds `boundaries` for `$AGENT_ID`; idempotent |
-| `overseer/internal/db` | **[built]** | pgxpool wrapper; four queries |
-| `overseer/internal/evaluator` | **[built]** | gpt-4o-mini via langchaingo — async tail only |
-| `overseer/internal/chain` | **[built]** | Audit-log and punishment contract writes |
-| `overseer/cmd/overseer` | **[stub]** | Prints a banner; the poll loop is not wired |
+| `overseer/cmd/migrate` | **[built]** | Applies pending migrations; `-dry-run` gates a deploy |
+| `overseer/cmd/reset-user` | **[built]** | Clears a user's risk. The only path that lowers a tier |
 | Gateway, heuristics, tool splicer | **[planned]** | Not started. Nothing above is on a request path yet |
 
 ---
@@ -202,8 +193,9 @@ stops being achievable as soon as an `ALTER` is needed — see the hand-written 
 ```sh
 go build ./...
 go vet ./...
-go run ./overseer/cmd/seed       # seed boundaries
-go run ./overseer/cmd/overseer   # currently a stub
+go run ./overseer/cmd/migrate            # apply pending migrations
+go run ./overseer/cmd/migrate -dry-run   # list pending; non-zero exit if any
+go run ./overseer/cmd/reset-user -user X # clear a user's accumulated risk
 psql "$POSTGRES_DSN" -f migrations/0001_init.sql
 ```
 
@@ -213,15 +205,10 @@ Loaded from `.env` (gitignored).
 
 | Variable | Used by |
 |---|---|
-| `POSTGRES_DSN`, `AGENT_ID` | seeder, overseer |
-| `OPENAI_API_KEY` | evaluator (langchaingo) |
-| `ALCHEMY_RPC_URL`, `PRIVATE_KEY` | chain client |
-| `AUDIT_LOG_ADDRESS`, `PUNISHMENT_ADDRESS` | chain client |
-| `LLAMA_GUARD_URL` *(planned)* | semantic gate |
+| `POSTGRES_DSN` | the application database |
+| `LLAMA_GUARD_URL` *(phase 4)* | semantic gate endpoint |
 | `TEST_POSTGRES_DSN` | database tests; they **skip silently** without it |
 | `REQUIRE_DB_TESTS` | set to any value to turn those skips into failures |
-
----
 
 ## Roadmap
 
@@ -229,15 +216,23 @@ Loaded from `.env` (gitignored).
    Pure and unit-testable, with no I/O.~~ **Done.**
 2. ~~**Identity and session storage** — JWT verification, session load/create with
    cross-session carry-forward, transactional decision writes under a row lock.~~ **Done.**
-3. **Gateway skeleton** — reverse proxy that forwards upstream unmodified, with session loading
-   and pass-through logging. Correct plumbing before any enforcement. **Next.**
-4. **Inbound inspection** — fast heuristics, then the Llama Guard 3 client with concurrent
-   fan-out, a timeout, and fail-closed demotion.
-5. **Tool splicing** — tool-to-category registry, request rewriting, model routing per level,
-   level-3 static refusal.
-6. **Outbound inspection** — `tool_call` allowlist enforcement, output scan, async audit worker.
-7. **Hardening** — load testing against the latency budget, chaos testing the inference
-   dependency, end-to-end bypass attempts.
+3. **Gateway skeleton** — reverse proxy forwarding upstream unmodified, with session loading and
+   pass-through logging. Correct plumbing before any enforcement. Define the `Inspector` interface
+   here even though nothing implements it yet, so phase 4 plugs in rather than carves out.
+   **Next.**
+4. **Inbound inspection** — fast heuristics in-process, plus a Llama Guard 3 client, both legs in
+   flight concurrently under a shared deadline. Timeout or outage applies a request-scoped floor
+   (see `capability.EffectiveTier`), never a persisted demotion. Log-only until the latency budget
+   is measured.
+5. **Tool splicing** — tool-to-category registry, request rewriting, model routing per tier,
+   tier-3 static refusal.
+6. **Outbound inspection** — `tool_call` allowlist enforced before execution, output scan, async
+   audit writer.
+7. **Evaluation** — a labelled corpus (benign / injection / harmful) and an offline scoring
+   script. The thresholds are arbitrary until something measures the false-positive rate, and
+   since a demotion restricts a real user, that is the number that decides whether this is usable.
+8. **Hardening** — load testing against the latency budget, chaos-testing the inference
+   dependency, deliberate bypass attempts.
 
 ## Decisions
 
@@ -269,8 +264,19 @@ Clients receive that `request_id` in a response header — enough to quote in a 
 not enough to learn anything. The tier is deliberately **not** exposed to clients: a number that
 changes as you probe is an oracle for the thresholds.
 
+**Llama Guard 3 8B, not 1B.** The 1B exists for on-device use where 5GB of weights is not
+available; it trades accuracy for that. Accuracy matters here specifically because false positives
+restrict real users, and the hardware has the headroom. The model is a config value rather than a
+constant, so once the phase 7 corpus exists this becomes a measurement rather than a judgement.
+
+**A stub inspector alongside the real one.** Tests and CI run against a deterministic stub behind
+the same interface; the demo runs against Ollama. A guardrail whose test suite needs a GPU does
+not get run.
+
 ## Open questions
 
 - Session store: in-memory with write-behind, or Postgres in the hot path?
-- Is `agent_id` an Ethereum address? The chain client assumes so; the schema says `TEXT`.
-- What is `rule_hash` for? It is computed at seed time and never read.
+- Where does the tool registry come from — a static map, an operator-editable config file, or a
+  per-agent table? Nothing constructs one outside tests today.
+- Does an unclassified inbound tool name get recorded as a `TOOL_VALIDATOR` event, or silently
+  stripped? Silent stripping is indistinguishable from a model regression.

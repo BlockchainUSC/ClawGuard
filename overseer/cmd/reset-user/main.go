@@ -16,8 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"openclaw/oversight/overseer/internal/config"
-	"openclaw/oversight/overseer/internal/session"
+	"openclaw/guard/overseer/internal/config"
+	"openclaw/guard/overseer/internal/session"
 )
 
 func main() {

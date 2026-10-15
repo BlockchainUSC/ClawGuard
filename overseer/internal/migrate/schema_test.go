@@ -1,4 +1,4 @@
-package db
+package migrate_test
 
 import (
 	"context"
@@ -9,11 +9,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"openclaw/oversight/overseer/internal/capability"
-	"openclaw/oversight/overseer/internal/dbtest"
+	"openclaw/guard/overseer/internal/capability"
+	"openclaw/guard/overseer/internal/dbtest"
 )
 
-// These tests exercise the real migration against a real PostgreSQL server.
+// These tests exercise the schema the migrations produce, against a real
+// PostgreSQL server.
+//
+// They live beside the runner rather than in a package of their own because
+// what they assert is "the migrations produce this", which is the runner's
+// output. migrate_test.go covers the runner's own behaviour.
 //
 // They are not mocked deliberately: every defect they are written to catch —
 // CHECK constraint coverage, trigger behaviour, idempotency — is invisible to a
@@ -47,8 +52,7 @@ func TestMigration_ProducesTheExpectedSchema(t *testing.T) {
 	dbtest.ApplyMigration(t, ctx, pool) // second call: must not error
 
 	for _, table := range []string{
-		"session_states", "guardrail_violations", "violation_sources",
-		"actions", "boundaries", "violations", "schema_migrations",
+		"session_states", "guardrail_violations", "violation_sources", "schema_migrations",
 	} {
 		var exists bool
 		err := pool.QueryRow(ctx,
@@ -59,6 +63,20 @@ func TestMigration_ProducesTheExpectedSchema(t *testing.T) {
 		}
 		if !exists {
 			t.Errorf("table %s was not created", table)
+		}
+	}
+
+	// 0002 removed the inherited async-worker tables. If one reappears, a
+	// migration has been applied out of order or 0002 was skipped.
+	for _, gone := range []string{"actions", "boundaries", "violations"} {
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM information_schema.tables
+			                WHERE table_schema = current_schema() AND table_name = $1)`, gone).Scan(&exists); err != nil {
+			t.Fatalf("checking %s: %v", gone, err)
+		}
+		if exists {
+			t.Errorf("table %s still exists; 0002 did not run", gone)
 		}
 	}
 }

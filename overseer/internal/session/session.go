@@ -12,8 +12,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"openclaw/oversight/overseer/internal/auth"
-	"openclaw/oversight/overseer/internal/capability"
+	"openclaw/guard/overseer/internal/auth"
+	"openclaw/guard/overseer/internal/capability"
 )
 
 // ErrSessionNotOwned means the session exists but belongs to a different user.

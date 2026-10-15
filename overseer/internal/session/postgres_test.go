@@ -11,10 +11,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"openclaw/oversight/overseer/internal/auth"
-	"openclaw/oversight/overseer/internal/capability"
-	"openclaw/oversight/overseer/internal/dbtest"
-	"openclaw/oversight/overseer/internal/session"
+	"openclaw/guard/overseer/internal/auth"
+	"openclaw/guard/overseer/internal/capability"
+	"openclaw/guard/overseer/internal/dbtest"
+	"openclaw/guard/overseer/internal/session"
 )
 
 // The specification for PostgresStore. Each test names one behaviour.

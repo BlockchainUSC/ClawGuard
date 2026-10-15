@@ -4,21 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A guardrail system for LLM agents, being built as **two services with different execution models**.
-Read `README.md` for the full architecture before making design decisions.
+A guardrail gateway for LLM agents. A Go reverse proxy sits inline in front of an agent runtime,
+inspects inbound prompts, computes a **capability tier** for the session, rewrites the upstream
+request to strip tools the session may no longer use, and inspects outbound tool calls and
+assistant text. Read `README.md` for the architecture before making design decisions.
 
-1. **Guardrail Gateway** *(planned — no code yet)*. A synchronous Go reverse proxy in the request
-   path. It inspects inbound prompts via two concurrent layers (in-process fast heuristics; a
-   Llama Guard 3 inference service over RPC/HTTP), computes a **capability profile** for the
-   session, rewrites the upstream request accordingly, then inspects outbound `tool_call`s and
-   assistant text. Latency-critical.
-2. **Overseer** *(what currently exists)*. An async batch worker that polls the shared `actions`
-   table, evaluates against boundaries with an LLM, and anchors violations on-chain. This is the
-   "Audit Logger (Async Worker)" tail in the architecture diagram. Not latency-sensitive.
+The security model (`internal/capability`), identity (`internal/auth`) and session persistence
+(`internal/session`) are built and tested. **The HTTP gateway itself does not exist yet**, so none
+of it is on a request path.
 
-**Do not conflate these.** Everything in `overseer/` today belongs to service 2. The gateway is a
-new tree. `internal/db` and `internal/chain` are shared; `internal/evaluator` (gpt-4o-mini via
-langchaingo) is for the async tail only — inline semantic inspection uses Llama Guard 3 instead.
+A second, asynchronous service — an LLM evaluator and an on-chain anchoring worker — was inherited
+from the multi-team project this was forked from and has been removed; see
+`migrations/0002_drop_async_tail.sql`. Do not reintroduce it.
 
 ## Capability profiles (the central concept)
 
@@ -54,8 +51,6 @@ go run ./overseer/cmd/migrate -dry-run   # list pending; exits non-zero if any
 go run ./overseer/cmd/reset-user -user X # clear a user's risk (operator escape hatch)
 go vet ./...                    # static checks
 go test ./...                   # pure tests; db tests SKIP without a DSN
-go run ./overseer/cmd/seed      # seed boundaries for $AGENT_ID
-go run ./overseer/cmd/overseer  # still a stub main
 psql "$POSTGRES_DSN" -f migrations/0001_init.sql   # apply schema (idempotent)
 ```
 
@@ -88,16 +83,10 @@ application tables.
 
 ## Layout and import paths
 
-The module is `openclaw/oversight`, but all code lives one level down under `overseer/`, so
-internal packages import as `openclaw/oversight/overseer/internal/<pkg>` — not
-`openclaw/oversight/internal/<pkg>`. Getting this wrong is the most common build break.
+The module is `openclaw/guard`, but all code lives one level down under `overseer/`, so internal
+packages import as `openclaw/guard/overseer/internal/<pkg>` — not `openclaw/guard/internal/<pkg>`.
+Getting this wrong is the most common build break.
 
-- `overseer/cmd/overseer` — service entrypoint. Still a stub (`main` only prints a banner and
-  blank-imports the deps); the poll → evaluate → act loop is not wired up yet.
-- `overseer/cmd/seed` — one-shot seeder. Its `rules` slice is the source of truth for boundary
-  text; `rule_hash` is `sha256(rule)` hex, and the `(agent_id, rule_hash)` unique constraint plus
-  `ON CONFLICT DO NOTHING` makes re-running safe. Editing a rule's text creates a new row rather
-  than updating the old one, so stale boundaries must be deactivated by hand.
 - `overseer/internal/capability` — **the security model.** Tiers, profiles, the tool registry,
   risk scoring and decay, and `Policy.Decide` (the ratchet). Pure: no I/O, no clock reads, no
   mutable state a caller can reach. `now` is a parameter so decay is deterministic under test.
@@ -118,70 +107,23 @@ internal packages import as `openclaw/oversight/overseer/internal/<pkg>` — not
   `Decision.SignalDelta`**, never as one combined delta — decay applies once per elapsed period,
   signal weight once per evaluation, and conflating them let concurrent requests drain risk to
   zero.
+- `overseer/internal/migrate` — migration runner. Records each file in `schema_migrations` and
+  refuses to re-run one whose contents changed. **Never edit an applied migration; write the next
+  one.** The schema tests live here too, since what they assert is what the migrations produce.
 - `overseer/internal/dbtest` — throwaway-schema harness. `dbtest.Pool(t)` creates an isolated
   schema, applies the migration and drops it on cleanup. Finds `.env` by walking up from the
   package directory.
-- `overseer/internal/db` — pgxpool wrapper. The intended cycle is
-  `GetUnevaluatedActions` → `GetActiveBoundaries` → `InsertViolation` → `MarkEvaluated`.
-  Actions are polled 50 at a time, oldest first. `Payload` is kept as raw JSONB bytes and passed
-  to the LLM verbatim.
-- `overseer/internal/evaluator` — single stateless `Evaluate` call via langchaingo + OpenAI
-  (`gpt-4o-mini`, temperature 0). The prompt asks for bare JSON; a parse failure returns
-  `IsSuspicious: false` alongside the error, so callers must check the error rather than trust the
-  zero value. Note it constructs a fresh `openai.New` client on every call.
-- `overseer/internal/chain` — Ethereum writer. Contract ABIs are inline JSON string literals
-  (`auditLogABI`, `punishmentABI`) rather than generated bindings, and calls go out through
-  `bind.RawTransact`. `LogViolation`, `Suspend`, and `Shutdown` return the tx hash immediately and
-  do **not** wait for a receipt, so a returned hash is not proof of success. `agentID` is parsed
-  with `common.HexToAddress`, which silently yields the zero address for non-hex input.
-
-## Database
-
-`migrations/` is applied by `internal/migrate`, which records each file in `schema_migrations`
-and refuses to re-run one whose contents changed. **Do not edit an applied migration — write
-`0002`.** Idempotency is now the ledger's job, not the SQL's, which is what lets a migration
-contain `ALTER`.
-
-`migrations/0001_init.sql` is the source of truth. It holds the gateway tables
-(`session_states`, `guardrail_violations`) plus the inherited `actions` / `boundaries` /
-`violations`. `schema.sql` is superseded but retained until the `actions` shape is settled.
-
-Enumerated columns carry CHECK constraints deliberately — `current_tier`, `risk_score`,
-`direction`, `violation_source`, and a `downgrade_is_ratchet` constraint that enforces the
-capability ratchet in the database as well as in Go. `updated_at` is maintained by a
-`BEFORE UPDATE` trigger using `clock_timestamp()`, because `DEFAULT NOW()` fires only on insert.
-
-`guardrail_violations` stores `content_sha256` + a redacted `content_preview` as the durable
-record; `raw_content` is nullable and subject to a retention window. Storing violating text
-verbatim forever would make the audit log the system of record for the PII that the
-"must not output personal identifying information" boundary exists to prevent.
-
-## Environment
-
-Loaded from `.env` via godotenv (gitignored; there is no committed example file).
-
-- `POSTGRES_DSN`, `AGENT_ID` — required by the seeder
-- `ALCHEMY_RPC_URL`, `PRIVATE_KEY`, `AUDIT_LOG_ADDRESS`, `PUNISHMENT_ADDRESS` — required by
-  `chain.New`; all are checked up front and missing values are hard errors
-- `OPENAI_API_KEY` — read by langchaingo for the evaluator
-
-Note that `cmd/overseer` does not currently call `godotenv.Load()`; only `cmd/seed` does.
+- `POSTGRES_DSN` — the application database
+- `LLAMA_GUARD_URL` — semantic gate endpoint (phase 4)
+- `TEST_POSTGRES_DSN` — database tests; they **skip silently** without it
+- `REQUIRE_DB_TESTS` — set to any value to turn those skips into failures
 
 ## Unresolved design questions
 
 Carried in `README.md` under "Open questions" — streaming vs. output scanning, session-store
-placement, whether `agent_id` is an Ethereum address, and the unused `rule_hash`. The tool-name to
-capability-category mapping is also unspecified. Raise these rather than silently picking one.
+placement, and where the tool registry comes from — nothing constructs one outside tests today.
+Raise these rather than silently picking one.
 
 Resolved since: the session/risk schema arrived and is built as `session_states` and
 `guardrail_violations` in `migrations/0001_init.sql`. Session identity is server-issued JWT
 (`internal/auth`), with risk carried forward by `user_id` over a 24-hour window.
-
-## Known inconsistency to resolve
-
-The severity vocabularies disagree. `evaluator`'s prompt asks for `"warn" | "suspend" | "shutdown"`
-(action-shaped, matching the `chain` methods), while the `violations.severity` CHECK constraint in
-`schema.sql` only accepts `low | medium | high | critical`. Passing the LLM's severity straight
-into `InsertViolation` will violate the constraint. Pick one vocabulary (or add an explicit
-mapping) before wiring the main loop. Related: `chain.LogViolation` takes an `actionHash [32]byte`
-that nothing in the codebase computes yet.

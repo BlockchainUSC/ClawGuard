@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"openclaw/oversight/overseer/internal/dbtest"
-	"openclaw/oversight/overseer/internal/migrate"
+	"openclaw/guard/overseer/internal/dbtest"
+	"openclaw/guard/overseer/internal/migrate"
 )
 
 func write(t *testing.T, dir, name, body string) {

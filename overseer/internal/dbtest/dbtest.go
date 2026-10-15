@@ -26,7 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
-	"openclaw/oversight/overseer/internal/migrate"
+	"openclaw/guard/overseer/internal/migrate"
 )
 
 const (

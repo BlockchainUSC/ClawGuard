@@ -10,8 +10,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"openclaw/oversight/overseer/internal/auth"
-	"openclaw/oversight/overseer/internal/capability"
+	"openclaw/guard/overseer/internal/auth"
+	"openclaw/guard/overseer/internal/capability"
 )
 
 // PostgresStore implements Store against session_states and
