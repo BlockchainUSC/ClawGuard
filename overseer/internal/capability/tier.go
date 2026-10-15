@@ -77,3 +77,29 @@ func Stricter(a, b Tier) Tier {
 	}
 	return b
 }
+
+// EffectiveTier combines a session's stored tier with a request-scoped floor,
+// returning whichever is more restrictive.
+//
+// The floor exists so the system can say "the guard is unavailable" without
+// saying "this user is dangerous". Those are different claims and only the
+// second is evidence worth remembering.
+//
+// Availability failures — the semantic gate timing out, its inference service
+// unreachable — must restrict the request in front of them and nothing else.
+// Expressing them as a risk Signal instead would persist them: risk would
+// climb, a tier would be written, and because risk carries across sessions, a
+// minute of downtime would follow every user who was online at the time. The
+// floor is computed per request, applied here, and never written anywhere.
+//
+// An invalid input is treated as TierBlocked, so a corrupt value cannot widen
+// capability.
+func EffectiveTier(stored, floor Tier) Tier {
+	if !stored.Valid() {
+		stored = TierBlocked
+	}
+	if !floor.Valid() {
+		floor = TierBlocked
+	}
+	return Stricter(stored, floor)
+}

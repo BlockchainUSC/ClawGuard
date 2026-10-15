@@ -133,39 +133,52 @@ func (s *PostgresStore) loadByID(ctx context.Context, id uuid.UUID, user auth.Us
 	return sess, nil
 }
 
-// carryForward returns the worst tier and risk score this user accumulated
-// within the window, or zero values if they have no recent history.
+// carryForward returns the risk this user currently carries, and the tier that
+// risk justifies, for a session they are opening now.
+//
+// It carries RISK, not tier. Carrying the tier directly makes a demotion
+// permanent: each new session stamps a fresh updated_at, so the window slides
+// forward every time the user returns, and nothing anywhere lowers a tier. One
+// minute of inference downtime would quarantine a daily user for life.
+//
+// Risk decays, so a tier derived from it recovers on its own. The ratchet still
+// holds strictly within a single session, which is the guarantee this project
+// actually makes; it was never meant to span a user's whole history.
+//
+// Each candidate row is decayed from its own risk_updated_at before the worst
+// is taken, rather than taking MAX() in SQL. Two independent maxima could
+// describe a state that never existed, and a raw maximum ignores how long ago
+// the risk was earned — which is the entire point.
 func (s *PostgresStore) carryForward(ctx context.Context, userID string) (capability.Tier, int, error) {
-	var tier, risk int
-
-	// MAX, not "the most recent row". The ratchet is about the worst recent
-	// state: someone quarantined an hour ago who then opened three quiet
-	// sessions is still quarantined, and ORDER BY updated_at DESC LIMIT 1 would
-	// hand them a clean slate for the price of two throwaway connections.
-	//
-	// The two maxima are taken independently, so the pair can describe a state
-	// that never literally existed (tier from one session, score from another).
-	// That is the conservative direction — it can only ever be more restrictive
-	// — so it is left as is.
-	//
-	// COALESCE because MAX over zero rows is NULL, not 0, and a new user has no
-	// rows at all. Scanning NULL into an int fails.
-	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(MAX(current_tier), 0), COALESCE(MAX(risk_score), 0)
+	rows, err := s.pool.Query(ctx, `
+		SELECT risk_score, risk_updated_at, now()
 		  FROM session_states
 		 WHERE user_id = $1
 		   AND updated_at > now() - $2::interval`,
-		userID, carryForwardWindow,
-	).Scan(&tier, &risk)
+		userID, carryForwardWindow)
 	if err != nil {
 		return capability.TierBlocked, 0, err
 	}
+	defer rows.Close()
 
-	parsed, err := capability.ParseTier(tier)
-	if err != nil {
-		return capability.TierBlocked, risk, err
+	worst := 0
+	for rows.Next() {
+		var (
+			risk          int
+			riskAt, dbNow time.Time
+		)
+		if err := rows.Scan(&risk, &riskAt, &dbNow); err != nil {
+			return capability.TierBlocked, 0, err
+		}
+		if decayed := capability.Decay(risk, riskAt, dbNow, s.policy.HalfLife); decayed > worst {
+			worst = decayed
+		}
 	}
-	return parsed, risk, nil
+	if err := rows.Err(); err != nil {
+		return capability.TierBlocked, 0, err
+	}
+
+	return s.policy.Thresholds.TierFor(worst), worst, nil
 }
 
 // Apply implements Store.Apply; see that interface for why the decision and its
@@ -283,4 +296,22 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.
 		return Session{}, fmt.Errorf("commit for session %s: %w", sess.ID, err)
 	}
 	return updated, nil
+}
+
+// ResetUser clears risk and restores full capability for a user's sessions
+// inside the carry-forward window. See Store.ResetUser.
+//
+// risk_updated_at is reset alongside the score so the cleared state is current
+// rather than something that immediately decays from a stale baseline.
+func (s *PostgresStore) ResetUser(ctx context.Context, userID string) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE session_states
+		   SET current_tier = 0, risk_score = 0, risk_updated_at = now()
+		 WHERE user_id = $1
+		   AND updated_at > now() - $2::interval`,
+		userID, carryForwardWindow)
+	if err != nil {
+		return 0, fmt.Errorf("resetting %q: %w", userID, err)
+	}
+	return tag.RowsAffected(), nil
 }

@@ -25,8 +25,17 @@ langchaingo) is for the async tail only — inline semantic inspection uses Llam
 Execution capability is a tier (0 Full / 1 Constrained / 2 Quarantined / 3 Hard Block), not a
 boolean. Sessions are **demoted** when risk fires. Invariants that must hold in any implementation:
 
-- **Demotion is a ratchet** — within a session, the level never decreases without an explicit,
-  deliberate promotion policy. Do not add auto-recovery on a clean request.
+- **Demotion is a ratchet *within a session*** — nothing on the request path ever lowers a tier.
+  Do not add auto-recovery on a clean request.
+- **Across sessions, risk carries forward, not tier.** `carryForward` decays each of the user's
+  recent sessions' risk and re-derives a tier from the worst. Carrying the tier made demotion
+  permanent: each new session stamps a fresh `updated_at`, the window slides, and one minute of
+  inference downtime would quarantine a daily user for life.
+- **Availability failures use a floor, not a signal.** `capability.EffectiveTier(stored, floor)`
+  restricts the request in front of it and persists nothing. "The guard is down" and "this user is
+  dangerous" are different claims; only the second is evidence worth remembering.
+- **`session.Store.ResetUser` is the only path that lowers a tier**, and it is an operator command
+  (`cmd/reset-user`), unreachable from the request path. Without it a false positive has no remedy.
 - **Below level 2, the `tools[]` array is stripped entirely** before forwarding upstream.
 - **Level 3 never contacts the upstream model** — it returns a pre-compiled static refusal.
 - **The semantic gate fails closed.** If Llama Guard 3 times out or is unreachable, demote. Failing
@@ -40,6 +49,9 @@ All Go commands run from the repo root (the module root).
 
 ```sh
 go build ./...                  # build everything
+go run ./overseer/cmd/migrate            # apply pending migrations
+go run ./overseer/cmd/migrate -dry-run   # list pending; exits non-zero if any
+go run ./overseer/cmd/reset-user -user X # clear a user's risk (operator escape hatch)
 go vet ./...                    # static checks
 go test ./...                   # pure tests; db tests SKIP without a DSN
 go run ./overseer/cmd/seed      # seed boundaries for $AGENT_ID
@@ -125,7 +137,12 @@ internal packages import as `openclaw/oversight/overseer/internal/<pkg>` — not
 
 ## Database
 
-`migrations/0001_init.sql` is the source of truth and is idempotent. It holds the gateway tables
+`migrations/` is applied by `internal/migrate`, which records each file in `schema_migrations`
+and refuses to re-run one whose contents changed. **Do not edit an applied migration — write
+`0002`.** Idempotency is now the ledger's job, not the SQL's, which is what lets a migration
+contain `ALTER`.
+
+`migrations/0001_init.sql` is the source of truth. It holds the gateway tables
 (`session_states`, `guardrail_violations`) plus the inherited `actions` / `boundaries` /
 `violations`. `schema.sql` is superseded but retained until the `actions` shape is settled.
 

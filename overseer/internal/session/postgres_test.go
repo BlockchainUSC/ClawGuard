@@ -241,8 +241,11 @@ func TestLoadOrCreate_CarryForwardIndependentOfApply(t *testing.T) {
 		t.Errorf("new session tier = %s, want %s: reconnecting cleared the ratchet",
 			fresh.Tier, capability.TierQuarantined)
 	}
-	if fresh.RiskScore != 70 {
-		t.Errorf("risk = %d, want 70", fresh.RiskScore)
+	// Risk decays on the way across, so it arrives a little below where it was
+	// earned — but still high enough to justify the tier.
+	if fresh.RiskScore >= 70 || fresh.RiskScore < 60 {
+		t.Errorf("carried risk = %d, want decayed from 70 but still above the "+
+			"quarantine threshold", fresh.RiskScore)
 	}
 }
 
@@ -714,5 +717,156 @@ func TestApply_DecaysFromRiskBaselineNotLastWrite(t *testing.T) {
 	if got.RiskScore != 25 {
 		t.Errorf("risk = %d, want 25: decay was measured from the last write "+
 			"rather than from the risk baseline", got.RiskScore)
+	}
+}
+
+// R1: a tier must not outlive the risk that justified it.
+//
+// The failure this guards against: the semantic gate goes down for a minute and
+// every session in flight is demoted. Those demotions persist. Each new session
+// inherits the tier and stamps a fresh updated_at, so the carry-forward window
+// slides forward every time the user returns — and a user who comes back once a
+// day stays quarantined for life, with no command to undo it.
+//
+// Carrying the risk score instead fixes this on its own: risk decays, so the
+// tier derived from it recovers by itself. The ratchet still holds strictly
+// within a session, which is what CLAUDE.md actually promises.
+func TestLoadOrCreate_TierDoesNotOutliveTheRiskThatCausedIt(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	user := verifiedUser("recovering")
+
+	// Quarantined ten hours ago — twenty half-lives at the default policy, so
+	// the risk that justified it has long since decayed to nothing. The session
+	// is still inside the 24-hour carry-forward window.
+	seedSession(t, pool, ctx, user.ID, int(capability.TierQuarantined), 70, 10*time.Hour)
+
+	fresh, err := s.LoadOrCreate(ctx, session.NewID(), user)
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+
+	if fresh.RiskScore > 1 {
+		t.Errorf("carried risk = %d, want ~0: it was not decayed on the way across", fresh.RiskScore)
+	}
+	if fresh.Tier != capability.TierFull {
+		t.Errorf("tier = %s, want %s: the tier was carried directly instead of "+
+			"being re-derived from decayed risk, so it cannot recover", fresh.Tier, capability.TierFull)
+	}
+}
+
+// Recovery must not be instant: risk that has NOT decayed still restricts.
+func TestLoadOrCreate_RecentRiskStillRestrictsANewSession(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	user := verifiedUser("still-risky")
+
+	// Quarantine-level risk from one minute ago: barely decayed.
+	seedSession(t, pool, ctx, user.ID, int(capability.TierQuarantined), 70, time.Minute)
+
+	fresh, err := s.LoadOrCreate(ctx, session.NewID(), user)
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+	if fresh.Tier != capability.TierQuarantined {
+		t.Errorf("tier = %s, want %s: recent risk must still restrict", fresh.Tier, capability.TierQuarantined)
+	}
+}
+
+// ResetUser is the only path that lowers a tier, and it must actually work —
+// otherwise a false positive has no remedy at all.
+func TestResetUser_RestoresCapability(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	user := verifiedUser("wrongly-blocked")
+
+	sess := newSession(t, s, ctx, user.ID)
+	if _, err := s.Apply(ctx, sess, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierBlocked, SignalDelta: 150,
+	}, nil); err != nil {
+		t.Fatalf("blocking: %v", err)
+	}
+
+	n, err := s.ResetUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ResetUser: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("reset %d sessions, want at least 1", n)
+	}
+
+	// The existing session recovers...
+	reloaded, err := s.LoadOrCreate(ctx, sess.ID, user)
+	if err != nil {
+		t.Fatalf("reloading: %v", err)
+	}
+	if reloaded.Tier != capability.TierFull {
+		t.Errorf("tier = %s after reset, want %s", reloaded.Tier, capability.TierFull)
+	}
+	if reloaded.RiskScore != 0 {
+		t.Errorf("risk = %d after reset, want 0", reloaded.RiskScore)
+	}
+
+	// ...and a new session does not inherit the cleared risk.
+	fresh, err := s.LoadOrCreate(ctx, session.NewID(), user)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if fresh.Tier != capability.TierFull {
+		t.Errorf("new session tier = %s, want %s", fresh.Tier, capability.TierFull)
+	}
+}
+
+// Resetting one user must not touch anyone else's sessions.
+func TestResetUser_DoesNotAffectOtherUsers(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+
+	innocent := verifiedUser("bystander")
+	other := verifiedUser("unrelated")
+
+	bystander := newSession(t, s, ctx, innocent.ID)
+	if _, err := s.Apply(ctx, bystander, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierQuarantined, SignalDelta: 70,
+	}, nil); err != nil {
+		t.Fatalf("demoting: %v", err)
+	}
+
+	if _, err := s.ResetUser(ctx, other.ID); err != nil {
+		t.Fatalf("ResetUser: %v", err)
+	}
+
+	still, err := s.LoadOrCreate(ctx, bystander.ID, innocent)
+	if err != nil {
+		t.Fatalf("reloading: %v", err)
+	}
+	if still.Tier != capability.TierQuarantined {
+		t.Errorf("an unrelated user's reset cleared this session: tier = %s", still.Tier)
+	}
+}
+
+// Within a live session the ratchet still holds: nothing on the request path
+// can hand capability back, which is what makes ResetUser's existence matter.
+func TestApply_StillRatchetsWithinASession(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "ratcheted")
+
+	demoted, err := s.Apply(ctx, sess, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierQuarantined, SignalDelta: 70,
+	}, nil)
+	if err != nil {
+		t.Fatalf("demoting: %v", err)
+	}
+
+	// A later evaluation that sees no risk at all must not restore anything.
+	got, err := s.Apply(ctx, demoted, requestID(), capability.Decision{
+		From: capability.TierQuarantined, To: capability.TierFull, SignalDelta: 0,
+	}, nil)
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if got.Tier != capability.TierQuarantined {
+		t.Errorf("tier = %s, want %s: the in-session ratchet was lost", got.Tier, capability.TierQuarantined)
 	}
 }

@@ -94,10 +94,19 @@ demoted when risk signals fire. Every request is served under the session's curr
 | 2 | Quarantined | Conversational only | **None** — tool payload stripped | Lightweight model / strict guard prompt |
 | 3 | Hard Block | Terminated | None | Pre-compiled static refusal |
 
-**Demotion is a ratchet.** Within a session, level only ever increases (capability only
-decreases). Re-promotion, if allowed at all, must be an explicit policy decision with a decay
-window — never an automatic consequence of one clean request. At level 3 the upstream model is
-never contacted; the gateway returns a static refusal.
+**Demotion is a ratchet within a session.** Nothing on the request path lowers a tier, and at
+level 3 the upstream model is never contacted.
+
+**Across sessions, risk carries forward rather than the tier.** Risk decays, so the tier derived
+from it recovers on its own. Carrying the tier instead made every demotion permanent: each new
+session refreshed the carry-forward window, so a user who returned daily could never recover.
+
+**Availability failures apply a request-scoped floor that is never stored.** If the semantic gate
+is unreachable the request in front of it is restricted and nothing is written — otherwise a
+minute of downtime would follow every user who happened to be online.
+
+**One operator command lowers a tier.** `cmd/reset-user` clears a user's accumulated risk. It is
+the remedy for a false positive, and it is deliberately not reachable from the request path.
 
 ---
 

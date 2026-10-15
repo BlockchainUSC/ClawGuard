@@ -125,3 +125,39 @@ func TestTier_ParseAndString(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveTier(t *testing.T) {
+	cases := []struct {
+		name          string
+		stored, floor Tier
+		want          Tier
+	}{
+		{"no floor leaves the session alone", TierFull, TierFull, TierFull},
+		{"floor restricts an unrestricted session", TierFull, TierQuarantined, TierQuarantined},
+		{"floor does not relax a demoted session", TierBlocked, TierConstrained, TierBlocked},
+		{"stored wins when stricter", TierQuarantined, TierConstrained, TierQuarantined},
+		{"floor wins when stricter", TierConstrained, TierQuarantined, TierQuarantined},
+		{"invalid stored fails closed", Tier(99), TierFull, TierBlocked},
+		{"invalid floor fails closed", TierFull, Tier(-1), TierBlocked},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := EffectiveTier(c.stored, c.floor); got != c.want {
+				t.Errorf("EffectiveTier(%s, %s) = %s, want %s", c.stored, c.floor, got, c.want)
+			}
+		})
+	}
+}
+
+// The floor must never be able to make a session less restricted than it is
+// stored as — that is the whole reason it is a floor and not an override.
+func TestEffectiveTier_NeverRelaxes(t *testing.T) {
+	for _, stored := range allTiers {
+		for _, floor := range allTiers {
+			if got := EffectiveTier(stored, floor); got < stored {
+				t.Errorf("EffectiveTier(%s, %s) = %s, which is less restrictive than stored",
+					stored, floor, got)
+			}
+		}
+	}
+}

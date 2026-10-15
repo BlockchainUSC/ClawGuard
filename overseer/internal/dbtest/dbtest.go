@@ -117,8 +117,23 @@ func Pool(t *testing.T) (*pgxpool.Pool, context.Context) {
 	// migration script is multi-statement so it needs the simple protocol.
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
 	cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	// Enough for the concurrency tests to contend; beyond this they queue,
+	// which still exercises the row lock.
+	cfg.MaxConns = 8
+	cfg.MinConns = 0
 
-	admin, err := pgxpool.New(ctx, dsn)
+	// Bound both pools. go test runs packages in parallel, each test here opens
+	// two pools, and PostgreSQL's default max_connections is 100 — an unbounded
+	// default exhausts the server as the suite grows and surfaces as a test
+	// failing in milliseconds with a connection error rather than an assertion.
+	adminCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", DSNEnv, err)
+	}
+	adminCfg.MaxConns = 2
+	adminCfg.MinConns = 0
+
+	admin, err := pgxpool.NewWithConfig(ctx, adminCfg)
 	if err != nil {
 		t.Fatalf("connecting: %v", err)
 	}
