@@ -83,6 +83,9 @@ func (p Policy) Decide(cur Tier, score int, last time.Time, sigs []Signal, now t
 			w = 0
 		}
 		delta += w
+		// Note the comparison: only an explicit ConfidenceLow keeps the cap
+		// alive. An unset field (ConfidenceUnspecified) clears it, so a
+		// forgotten Confidence over-enforces rather than under-enforces.
 		if s.Confidence != ConfidenceLow {
 			onlyLowConfidence = false
 		}

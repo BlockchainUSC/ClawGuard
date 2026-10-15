@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS guardrail_violations (
                                CHECK (violation_source IN ('FAST_REGEX', 'ENTROPY',
                                       'TOKEN_SPIKE', 'LLAMA_GUARD_3', 'TOOL_VALIDATOR')),
     llama_guard_code       VARCHAR(32),
-    content_sha256         CHAR(64) NOT NULL,
+    content_sha256         CHAR(64) NOT NULL
+                               CHECK (content_sha256 ~ '^[0-9a-f]{64}$'),
     content_preview        TEXT NOT NULL,
     raw_content            TEXT,
     applied_downgrade_from INT CHECK (applied_downgrade_from BETWEEN 0 AND 3),
@@ -62,6 +63,26 @@ CREATE TABLE IF NOT EXISTS guardrail_violations (
 
 CREATE INDEX IF NOT EXISTS idx_violations_session
     ON guardrail_violations(session_id, created_at DESC);
+
+-- CREATE TABLE IF NOT EXISTS skips an existing table entirely, so the CHECK
+-- above never reaches a database created before it was added. Postgres has no
+-- ADD CONSTRAINT IF NOT EXISTS, hence the guard.
+--
+-- This is the point at which a real migration runner starts earning its keep:
+-- ALTER statements are not naturally idempotent, and hand-written guards like
+-- this one do not scale past a couple of them.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'guardrail_violations_content_sha256_check'
+           AND conrelid = 'guardrail_violations'::regclass
+    ) THEN
+        ALTER TABLE guardrail_violations
+            ADD CONSTRAINT guardrail_violations_content_sha256_check
+            CHECK (content_sha256 ~ '^[0-9a-f]{64}$');
+    END IF;
+END $$;
 
 -- DEFAULT NOW() only fires on INSERT, so updated_at needs a trigger or it stays
 -- permanently equal to created_at. clock_timestamp() rather than now() so the

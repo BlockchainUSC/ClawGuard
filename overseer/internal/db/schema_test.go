@@ -217,3 +217,40 @@ func TestDotEnvIsDiscoverable(t *testing.T) {
 			dbtest.RequireEnv, dbtest.DSNEnv)
 	}
 }
+
+// content_sha256 is the durable record once raw_content ages out of retention,
+// so a truncated or empty digest silently destroys the audit trail. CHAR(64)
+// alone does not prevent that: it pads and accepts anything.
+func TestMigration_RejectsMalformedContentHash(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	session := insertSession(t, ctx, pool, 0)
+
+	for _, bad := range []string{"", "abc", "ZZ", "NOT-A-HASH"} {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO guardrail_violations
+			   (session_id, direction, violation_source, content_sha256, content_preview)
+			 VALUES ($1, 'INBOUND', 'FAST_REGEX', $2, 'preview')`, session, bad)
+		if err == nil {
+			t.Errorf("content_sha256 = %q was accepted", bad)
+		}
+	}
+
+	// Uppercase hex is also wrong: one content hash must have one spelling, or
+	// deduplicating and joining on it quietly stops working.
+	_, err := pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('A', 64), 'preview')`, session)
+	if err == nil {
+		t.Error("an uppercase digest was accepted")
+	}
+
+	// A well-formed digest still works.
+	_, err = pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview')`, session)
+	if err != nil {
+		t.Errorf("a valid digest was rejected: %v", err)
+	}
+}

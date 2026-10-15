@@ -32,7 +32,18 @@ const (
 type Confidence int
 
 const (
-	ConfidenceLow Confidence = iota
+	// ConfidenceUnspecified is the zero value, and is deliberately NOT
+	// ConfidenceLow.
+	//
+	// Treating "nobody set this field" as "low confidence" fails open: it caps
+	// demotion at TierConstrained, silently, with no error. A Llama Guard
+	// client that builds a Signal for a confirmed hazard and forgets to set
+	// Confidence would under-enforce and look like it was working.
+	//
+	// Only an explicit ConfidenceLow earns the cap. Everything else, including
+	// a forgotten field, is treated as confirmed evidence.
+	ConfidenceUnspecified Confidence = iota
+	ConfidenceLow
 	ConfidenceHigh
 )
 

@@ -16,8 +16,8 @@ func randomSignals(rng *rand.Rand) []Signal {
 	for i := 0; i < n; i++ {
 		sigs = append(sigs, Signal{
 			Source:     sources[rng.IntN(len(sources))],
-			Weight:     rng.IntN(120) - 20, // deliberately includes negatives
-			Confidence: Confidence(rng.IntN(2)),
+			Weight:     rng.IntN(120) - 20,      // deliberately includes negatives
+			Confidence: Confidence(rng.IntN(3)), // includes ConfidenceUnspecified
 		})
 	}
 	return sigs
@@ -204,5 +204,33 @@ func TestDecision_RecordsReasoning(t *testing.T) {
 	}
 	if len(d.Reasons) == 0 {
 		t.Fatal("demotion recorded no reasoning; the audit log would say what but never why")
+	}
+}
+
+// A Signal whose Confidence was never set must NOT be treated as a noisy
+// heuristic. The low-confidence cap is a concession to false positives from
+// entropy and token-spike checks; a caller that forgot the field has made no
+// such claim, and guessing "low" on their behalf silently under-enforces.
+func TestDecide_UnsetConfidenceDoesNotEarnTheLowConfidenceCap(t *testing.T) {
+	p := DefaultPolicy()
+
+	forgotten := []Signal{{Source: SourceLlamaGuard, Code: "S13", Weight: 500}}
+	explicit := []Signal{{Source: SourceLlamaGuard, Code: "S13", Weight: 500, Confidence: ConfidenceHigh}}
+
+	got := p.Decide(TierFull, 0, testNow, forgotten, testNow)
+	want := p.Decide(TierFull, 0, testNow, explicit, testNow)
+
+	if got.To != want.To {
+		t.Errorf("omitting Confidence gave tier %s, explicit high gave %s: "+
+			"a forgotten field silently reduced enforcement", got.To, want.To)
+	}
+	if got.To != TierBlocked {
+		t.Errorf("tier = %s, want %s", got.To, TierBlocked)
+	}
+
+	// And an explicit low-confidence signal must still be capped.
+	low := []Signal{{Source: SourceEntropy, Weight: 500, Confidence: ConfidenceLow}}
+	if capped := p.Decide(TierFull, 0, testNow, low, testNow); capped.To != TierConstrained {
+		t.Errorf("explicit low-confidence gave %s, want %s", capped.To, TierConstrained)
 	}
 }
