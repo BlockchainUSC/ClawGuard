@@ -174,7 +174,7 @@ func (s *PostgresStore) carryForward(ctx context.Context, userID string) (capabi
 // The decision was computed from a session read at some earlier moment, which
 // may since have changed. Everything below re-derives from the locked row
 // rather than trusting the struct it was handed.
-func (s *PostgresStore) Apply(ctx context.Context, sess Session, d capability.Decision, vs []Violation) (Session, error) {
+func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.UUID, d capability.Decision, vs []Violation) (Session, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Session{}, fmt.Errorf("begin: %w", err)
@@ -187,16 +187,21 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, d capability.De
 	// concurrent demotions both read the old tier, both compute a result from
 	// it, and the second write silently erases the first — leaving the session
 	// at whichever committed last rather than at the stricter of the two.
+	// risk_updated_at, not updated_at. The trigger advances updated_at on every
+	// write for any reason, so decay measured from it would silently become
+	// zero the moment anything added a per-request counter or last_seen_at —
+	// and risk scores would only ever climb.
+	//
 	// now() comes from the same query as the row, so decay is measured against
 	// the database's clock rather than this process's. One clock, no skew.
 	var (
 		lockedTier, lockedRisk int
-		lockedUpdatedAt, dbNow time.Time
+		lockedRiskAt, dbNow    time.Time
 	)
 	err = tx.QueryRow(ctx,
-		`SELECT current_tier, risk_score, updated_at, now()
+		`SELECT current_tier, risk_score, risk_updated_at, now()
 		   FROM session_states WHERE session_id = $1 FOR UPDATE`,
-		sess.ID).Scan(&lockedTier, &lockedRisk, &lockedUpdatedAt, &dbNow)
+		sess.ID).Scan(&lockedTier, &lockedRisk, &lockedRiskAt, &dbNow)
 	if err != nil {
 		// Includes pgx.ErrNoRows: Apply never conjures a session LoadOrCreate
 		// did not make.
@@ -228,7 +233,7 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, d capability.De
 	//
 	// Decay is recomputed here from the LOCKED row's updated_at, so it reflects
 	// time actually elapsed rather than whatever the caller read earlier.
-	decayed := capability.Decay(lockedRisk, lockedUpdatedAt, dbNow, s.policy.HalfLife)
+	decayed := capability.Decay(lockedRisk, lockedRiskAt, dbNow, s.policy.HalfLife)
 	risk := capability.ClampScore(decayed + d.SignalDelta)
 
 	var (
@@ -236,7 +241,8 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, d capability.De
 		updatedTier int
 	)
 	err = tx.QueryRow(ctx,
-		`UPDATE session_states SET current_tier = $2, risk_score = $3
+		`UPDATE session_states
+		    SET current_tier = $2, risk_score = $3, risk_updated_at = now()
 		  WHERE session_id = $1
 		 RETURNING `+sessionColumns,
 		sess.ID, int(final), risk,
@@ -259,11 +265,11 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, d capability.De
 	for i, v := range vs {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO guardrail_violations
-				(session_id, direction, violation_source, llama_guard_code,
+				(session_id, request_id, direction, violation_source, llama_guard_code,
 				 content_sha256, content_preview, raw_content,
 				 applied_downgrade_from, applied_downgrade_to, metadata)
-			VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10)`,
-			sess.ID, string(v.Direction), string(v.Source), v.LlamaGuardCode,
+			VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11)`,
+			sess.ID, requestID, string(v.Direction), string(v.Source), v.LlamaGuardCode,
 			v.ContentSHA256, v.ContentPreview, v.RawContent,
 			int(current), int(final), v.Metadata)
 		if err != nil {

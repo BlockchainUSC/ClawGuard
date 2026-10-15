@@ -25,6 +25,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+
+	"openclaw/oversight/overseer/internal/migrate"
 )
 
 const (
@@ -142,18 +144,19 @@ func Pool(t *testing.T) (*pgxpool.Pool, context.Context) {
 	return pool, ctx
 }
 
-// ApplyMigration applies migrations/0001_init.sql into whatever schema pool is
-// bound to. Pool calls it once; it is exported for the test that re-applies the
-// migration to prove it is idempotent, which is the property the hand-written
-// guards in that file exist to preserve.
+// ApplyMigration runs every migration in migrations/, in order, through the
+// same runner the real command uses.
+//
+// Using the runner rather than reading one file means tests exercise the apply
+// path itself: a migration that is unreadable, out of order, or that conflicts
+// with an earlier one fails here rather than in production.
 func ApplyMigration(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	t.Helper()
-	path := filepath.Join(repoRoot(t), "migrations", "0001_init.sql")
-	migration, err := os.ReadFile(path)
+	applied, err := migrate.Apply(ctx, pool, filepath.Join(repoRoot(t), "migrations"))
 	if err != nil {
-		t.Fatalf("reading migration %s: %v", path, err)
+		t.Fatalf("applying migrations: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(migration)); err != nil {
-		t.Fatalf("applying migration: %v", err)
-	}
+	// Applying nothing is legitimate on a second call: the ledger records what
+	// has run. Pool checks below that the schema actually materialised.
+	_ = applied
 }

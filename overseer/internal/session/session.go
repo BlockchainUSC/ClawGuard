@@ -82,8 +82,13 @@ type Store interface {
 	// Apply persists a decision and its evidence together, atomically, and
 	// returns the session as it now stands.
 	//
+	// requestID correlates every row produced by one turn — inbound heuristics,
+	// the semantic verdict, outbound tool-call interceptions, the output scan.
+	// It is a parameter rather than a field on Violation so that one call
+	// cannot file its evidence under two different requests.
+	//
 	// Together is the point. A demotion written without its violations is an
 	// unexplained punishment; violations written without the demotion is an
 	// observation nobody acted on. Either alone is worse than neither.
-	Apply(ctx context.Context, s Session, d capability.Decision, vs []Violation) (Session, error)
+	Apply(ctx context.Context, s Session, requestID uuid.UUID, d capability.Decision, vs []Violation) (Session, error)
 }

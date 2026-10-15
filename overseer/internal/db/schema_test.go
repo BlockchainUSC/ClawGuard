@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"openclaw/oversight/overseer/internal/capability"
 	"openclaw/oversight/overseer/internal/dbtest"
 )
 
@@ -34,14 +35,21 @@ func insertSession(t *testing.T, ctx context.Context, pool *pgxpool.Pool, tier i
 	return id
 }
 
-// The migration applies cleanly to an empty database, and applying it twice is
-// a no-op rather than an error.
-func TestMigration_IsIdempotent(t *testing.T) {
+// The migrations produce the expected schema, and re-running the runner is a
+// no-op rather than an error.
+//
+// Idempotency used to be a property of the SQL itself (every statement was
+// CREATE ... IF NOT EXISTS). It is now a property of the runner's ledger, which
+// is what lets a migration contain ALTER. The runner's own behaviour is tested
+// in internal/migrate; this checks the result.
+func TestMigration_ProducesTheExpectedSchema(t *testing.T) {
 	pool, ctx := dbtest.Pool(t)
-	dbtest.ApplyMigration(t, ctx, pool) // second application
-	dbtest.ApplyMigration(t, ctx, pool) // third, for good measure
+	dbtest.ApplyMigration(t, ctx, pool) // second call: must not error
 
-	for _, table := range []string{"session_states", "guardrail_violations", "actions", "boundaries", "violations"} {
+	for _, table := range []string{
+		"session_states", "guardrail_violations", "violation_sources",
+		"actions", "boundaries", "violations", "schema_migrations",
+	} {
 		var exists bool
 		err := pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM information_schema.tables
@@ -99,8 +107,8 @@ func TestMigration_RejectsUnknownEnumValues(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := pool.Exec(ctx,
 				`INSERT INTO guardrail_violations
-				   (session_id, direction, violation_source, content_sha256, content_preview)
-				 VALUES ($1, $2, $3, repeat('a', 64), 'preview')`,
+				   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+				 VALUES ($1, gen_random_uuid(), $2, $3, repeat('a', 64), 'preview')`,
 				session, c.direction, c.src)
 			if err == nil {
 				t.Errorf("direction=%q source=%q was accepted", c.direction, c.src)
@@ -117,9 +125,9 @@ func TestMigration_RejectsUpgradeRecordedAsDowngrade(t *testing.T) {
 
 	_, err := pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, content_sha256, content_preview,
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview,
 		    applied_downgrade_from, applied_downgrade_to)
-		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview', 2, 1)`, session)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview', 2, 1)`, session)
 	if err == nil {
 		t.Error("a downgrade from tier 2 to tier 1 was accepted")
 	}
@@ -127,9 +135,9 @@ func TestMigration_RejectsUpgradeRecordedAsDowngrade(t *testing.T) {
 	// The same values in the correct direction must be accepted.
 	_, err = pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, content_sha256, content_preview,
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview,
 		    applied_downgrade_from, applied_downgrade_to)
-		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview', 1, 2)`, session)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview', 1, 2)`, session)
 	if err != nil {
 		t.Errorf("a legitimate downgrade 1 -> 2 was rejected: %v", err)
 	}
@@ -176,9 +184,9 @@ func TestMigration_ViolationsSurviveWithRequiredContentColumns(t *testing.T) {
 	// while the hash and redacted preview are the durable record.
 	_, err := pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, llama_guard_code,
+		   (session_id, request_id, direction, violation_source, llama_guard_code,
 		    content_sha256, content_preview, raw_content, metadata)
-		 VALUES ($1, 'OUTBOUND', 'LLAMA_GUARD_3', 'S13', repeat('b', 64), 'redacted preview',
+		 VALUES ($1, gen_random_uuid(), 'OUTBOUND', 'LLAMA_GUARD_3', 'S13', repeat('b', 64), 'redacted preview',
 		         NULL, '{"latency_ms": 42}'::jsonb)`, session)
 	if err != nil {
 		t.Errorf("a violation row with raw_content NULL was rejected: %v", err)
@@ -186,8 +194,8 @@ func TestMigration_ViolationsSurviveWithRequiredContentColumns(t *testing.T) {
 
 	// The hash and preview are not optional.
 	_, err = pool.Exec(ctx,
-		`INSERT INTO guardrail_violations (session_id, direction, violation_source, content_preview)
-		 VALUES ($1, 'INBOUND', 'ENTROPY', 'preview')`, session)
+		`INSERT INTO guardrail_violations (session_id, request_id, direction, violation_source, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'ENTROPY', 'preview')`, session)
 	if err == nil {
 		t.Error("a violation row without content_sha256 was accepted")
 	}
@@ -198,8 +206,8 @@ func TestMigration_ViolationRequiresKnownSession(t *testing.T) {
 
 	_, err := pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, content_sha256, content_preview)
-		 VALUES (gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('c', 64), 'preview')`)
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES (gen_random_uuid(), gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('c', 64), 'preview')`)
 	if err == nil {
 		t.Error("a violation referencing an unknown session was accepted")
 	}
@@ -228,8 +236,8 @@ func TestMigration_RejectsMalformedContentHash(t *testing.T) {
 	for _, bad := range []string{"", "abc", "ZZ", "NOT-A-HASH"} {
 		_, err := pool.Exec(ctx,
 			`INSERT INTO guardrail_violations
-			   (session_id, direction, violation_source, content_sha256, content_preview)
-			 VALUES ($1, 'INBOUND', 'FAST_REGEX', $2, 'preview')`, session, bad)
+			   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+			 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', $2, 'preview')`, session, bad)
 		if err == nil {
 			t.Errorf("content_sha256 = %q was accepted", bad)
 		}
@@ -239,8 +247,8 @@ func TestMigration_RejectsMalformedContentHash(t *testing.T) {
 	// deduplicating and joining on it quietly stops working.
 	_, err := pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, content_sha256, content_preview)
-		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('A', 64), 'preview')`, session)
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('A', 64), 'preview')`, session)
 	if err == nil {
 		t.Error("an uppercase digest was accepted")
 	}
@@ -248,9 +256,115 @@ func TestMigration_RejectsMalformedContentHash(t *testing.T) {
 	// A well-formed digest still works.
 	_, err = pool.Exec(ctx,
 		`INSERT INTO guardrail_violations
-		   (session_id, direction, violation_source, content_sha256, content_preview)
-		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview')`, session)
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview')`, session)
 	if err != nil {
 		t.Errorf("a valid digest was rejected: %v", err)
+	}
+}
+
+// capability.Source constants and the violation_sources table are two hand-
+// maintained copies of one vocabulary. Nothing stops them drifting except this.
+//
+// Drift is quiet in the dangerous direction: a Go constant with no row fails
+// the foreign key at insert time, which means an inspection layer silently
+// cannot record anything it detects.
+func TestViolationSources_MatchTheGoConstants(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+
+	inGo := []capability.Source{
+		capability.SourceFastRegex,
+		capability.SourceEntropy,
+		capability.SourceTokenSpike,
+		capability.SourceLlamaGuard,
+		capability.SourceToolValidator,
+	}
+
+	for _, src := range inGo {
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM violation_sources WHERE source = $1)`, string(src),
+		).Scan(&exists); err != nil {
+			t.Fatalf("checking %s: %v", src, err)
+		}
+		if !exists {
+			t.Errorf("capability.Source %q has no row in violation_sources; "+
+				"any violation from that layer would fail its foreign key", src)
+		}
+	}
+
+	// And nothing in the table that Go cannot produce.
+	rows, err := pool.Query(ctx, `SELECT source FROM violation_sources`)
+	if err != nil {
+		t.Fatalf("listing sources: %v", err)
+	}
+	defer rows.Close()
+	known := make(map[string]bool, len(inGo))
+	for _, s := range inGo {
+		known[string(s)] = true
+	}
+	for rows.Next() {
+		var src string
+		if err := rows.Scan(&src); err != nil {
+			t.Fatalf("scanning: %v", err)
+		}
+		if !known[src] {
+			t.Errorf("violation_sources has %q with no matching capability.Source constant", src)
+		}
+	}
+}
+
+// An unknown source must be rejected by the foreign key, exactly as the old
+// CHECK constraint did. Moving to a lookup table must not have loosened this.
+func TestViolationSources_RejectUnknownSource(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	session := insertSession(t, ctx, pool, 0)
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'VIBES', repeat('a', 64), 'preview')`, session)
+	if err == nil {
+		t.Error("an unknown violation_source was accepted")
+	}
+}
+
+// request_id cannot be backfilled, which is why it is NOT NULL from the start.
+// Without it, phase 6 cannot correlate the inbound signals, the tool-call
+// interceptions and the output scan belonging to one turn.
+func TestMigration_RequiresRequestID(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	session := insertSession(t, ctx, pool, 0)
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, 'INBOUND', 'FAST_REGEX', repeat('a', 64), 'preview')`, session)
+	if err == nil {
+		t.Error("a violation without a request_id was accepted")
+	}
+}
+
+// content_preview is bounded so the PII containment this table is built around
+// is enforced rather than merely intended. One caller passing the full content
+// as the "preview" would otherwise defeat the entire retention design.
+func TestMigration_BoundsContentPreview(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	session := insertSession(t, ctx, pool, 0)
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('a', 64), repeat('x', 513))`, session)
+	if err == nil {
+		t.Error("a 513-character preview was accepted; the bound is not enforced")
+	}
+
+	_, err = pool.Exec(ctx,
+		`INSERT INTO guardrail_violations
+		   (session_id, request_id, direction, violation_source, content_sha256, content_preview)
+		 VALUES ($1, gen_random_uuid(), 'INBOUND', 'FAST_REGEX', repeat('a', 64), repeat('x', 512))`, session)
+	if err != nil {
+		t.Errorf("a 512-character preview was rejected: %v", err)
 	}
 }

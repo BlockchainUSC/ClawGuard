@@ -38,6 +38,10 @@ func newSession(t *testing.T, s *session.PostgresStore, ctx context.Context, use
 
 // seedSession inserts a session row directly, with a chosen age.
 //
+// risk_updated_at is backdated alongside updated_at: it is the baseline decay
+// is measured from, and leaving it at its now() default would mean no time has
+// elapsed and no decay happens, however old the rest of the row looks.
+//
 // It cannot be done by creating a session and then UPDATEing updated_at: the
 // BEFORE UPDATE trigger rewrites that column to clock_timestamp() on every
 // update, so a backdated value never survives. INSERT does not fire that
@@ -51,8 +55,9 @@ func seedSession(t *testing.T, pool *pgxpool.Pool, ctx context.Context,
 	t.Helper()
 	id := session.NewID()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO session_states (session_id, user_id, current_tier, risk_score, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, now() - $5::interval, now() - $5::interval)`,
+		INSERT INTO session_states
+			(session_id, user_id, current_tier, risk_score, created_at, updated_at, risk_updated_at)
+		VALUES ($1, $2, $3, $4, now() - $5::interval, now() - $5::interval, now() - $5::interval)`,
 		id, userID, tier, risk, age.String()); err != nil {
 		t.Fatalf("seeding session: %v", err)
 	}
@@ -81,6 +86,11 @@ func violationCount(t *testing.T, pool *pgxpool.Pool, ctx context.Context, id uu
 	return n
 }
 
+// requestID stands in for the id the gateway will mint per inbound request.
+// Real callers reuse one across the whole turn so inbound and outbound evidence
+// correlate; tests mint a fresh one per call because they only make one.
+func requestID() uuid.UUID { return uuid.New() }
+
 func hash64(c byte) string { return strings.Repeat(string(c), 64) }
 
 // applyConcurrently runs one Apply per decision against the same session, all
@@ -100,7 +110,7 @@ func applyConcurrently(t *testing.T, s *session.PostgresStore, ctx context.Conte
 		go func() {
 			defer wg.Done()
 			<-start // release everyone together
-			_, errs[i] = s.Apply(ctx, sess, d, nil)
+			_, errs[i] = s.Apply(ctx, sess, requestID(), d, nil)
 		}()
 	}
 	close(start)
@@ -173,7 +183,7 @@ func TestLoadOrCreate_CarriesRiskForwardToANewSession(t *testing.T) {
 		SignalDelta: 70,
 		Reasons:     []string{"test demotion"},
 	}
-	if _, err := s.Apply(ctx, first, demotion, nil); err != nil {
+	if _, err := s.Apply(ctx, first, requestID(), demotion, nil); err != nil {
 		t.Fatalf("applying demotion: %v", err)
 	}
 
@@ -196,7 +206,7 @@ func TestLoadOrCreate_DoesNotLeakRiskBetweenUsers(t *testing.T) {
 	s := session.NewPostgresStore(pool)
 
 	guilty := newSession(t, s, ctx, "guilty")
-	if _, err := s.Apply(ctx, guilty, capability.Decision{
+	if _, err := s.Apply(ctx, guilty, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierBlocked, SignalDelta: 120,
 	}, nil); err != nil {
 		t.Fatalf("applying: %v", err)
@@ -276,7 +286,7 @@ func TestLoadOrCreate_RejectsAnotherUsersSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attacker session: %v", err)
 	}
-	if _, err := s.Apply(ctx, attackerSess, capability.Decision{
+	if _, err := s.Apply(ctx, attackerSess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierBlocked, SignalDelta: 150,
 	}, nil); err != nil {
 		t.Fatalf("blocking the attacker: %v", err)
@@ -325,7 +335,7 @@ func TestApply_PersistsDecisionAndViolationsTogether(t *testing.T) {
 		ContentPreview: "redacted",
 	}}
 
-	updated, err := s.Apply(ctx, sess, d, vs)
+	updated, err := s.Apply(ctx, sess, requestID(), d, vs)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -398,7 +408,7 @@ func TestApply_RollsBackEverythingWhenAViolationIsInvalid(t *testing.T) {
 		},
 	}
 
-	_, err := s.Apply(ctx, sess, capability.Decision{
+	_, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierQuarantined, SignalDelta: 70,
 	}, vs)
 	if err == nil {
@@ -422,14 +432,14 @@ func TestApply_StaleSessionCannotUndoANewerDemotion(t *testing.T) {
 	stale := newSession(t, s, ctx, "stale-reader") // tier 0 at read time
 
 	// Someone else quarantines it in the meantime.
-	if _, err := s.Apply(ctx, stale, capability.Decision{
+	if _, err := s.Apply(ctx, stale, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierQuarantined, SignalDelta: 70,
 	}, nil); err != nil {
 		t.Fatalf("first demotion: %v", err)
 	}
 
 	// The holder of the stale struct now applies a milder decision.
-	got, err := s.Apply(ctx, stale, capability.Decision{
+	got, err := s.Apply(ctx, stale, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierConstrained, SignalDelta: 30,
 	}, nil)
 	if err != nil {
@@ -445,14 +455,14 @@ func TestApply_IgnoresADecisionThatWouldPromote(t *testing.T) {
 	s := session.NewPostgresStore(pool)
 	sess := newSession(t, s, ctx, "promoter")
 
-	demoted, err := s.Apply(ctx, sess, capability.Decision{
+	demoted, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierBlocked, SignalDelta: 120,
 	}, nil)
 	if err != nil {
 		t.Fatalf("demoting: %v", err)
 	}
 
-	got, err := s.Apply(ctx, demoted, capability.Decision{
+	got, err := s.Apply(ctx, demoted, requestID(), capability.Decision{
 		From: capability.TierBlocked, To: capability.TierFull, SignalDelta: 0,
 	}, nil)
 	if err != nil {
@@ -471,13 +481,13 @@ func TestApply_RecordsTheTransitionThatActuallyHappened(t *testing.T) {
 	s := session.NewPostgresStore(pool)
 	sess := newSession(t, s, ctx, "bookkeeping")
 
-	if _, err := s.Apply(ctx, sess, capability.Decision{
+	if _, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierQuarantined, SignalDelta: 70,
 	}, nil); err != nil {
 		t.Fatalf("first demotion: %v", err)
 	}
 
-	_, err := s.Apply(ctx, sess, capability.Decision{
+	_, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierConstrained, SignalDelta: 30,
 	}, []session.Violation{{
 		Direction: session.Outbound, Source: capability.SourceToolValidator,
@@ -505,7 +515,7 @@ func TestApply_FailsOnUnknownSession(t *testing.T) {
 	s := session.NewPostgresStore(pool)
 
 	ghost := session.Session{ID: session.NewID(), UserID: "ghost", Tier: capability.TierFull}
-	if _, err := s.Apply(ctx, ghost, capability.Decision{
+	if _, err := s.Apply(ctx, ghost, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierConstrained, SignalDelta: 30,
 	}, nil); err == nil {
 		t.Error("Apply succeeded against a session that does not exist")
@@ -521,7 +531,7 @@ func TestApply_AcceptsADecisionWithNoViolations(t *testing.T) {
 	s := session.NewPostgresStore(pool)
 	sess := newSession(t, s, ctx, "quiet")
 
-	if _, err := s.Apply(ctx, sess, capability.Decision{
+	if _, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierFull, SignalDelta: 5,
 	}, nil); err != nil {
 		t.Fatalf("Apply with no violations: %v", err)
@@ -557,7 +567,7 @@ func TestApply_RiskNeverGoesNegative(t *testing.T) {
 	// A small score, left to rot for a year.
 	sess := seedSession(t, pool, ctx, "decayer", 0, 3, 365*24*time.Hour)
 
-	got, err := s.Apply(ctx, sess, capability.Decision{
+	got, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 		From: capability.TierFull, To: capability.TierFull, SignalDelta: 0,
 	}, nil)
 	if err != nil {
@@ -597,7 +607,7 @@ func TestApply_DoesNotLoseAnUpdateUnderRowContention(t *testing.T) {
 	// A mild decision, computed against the tier as it stands now (0).
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.Apply(ctx, sess, capability.Decision{
+		_, err := s.Apply(ctx, sess, requestID(), capability.Decision{
 			From: capability.TierFull, To: capability.TierConstrained,
 			SignalDelta: 30,
 		}, nil)
@@ -658,5 +668,51 @@ func TestApply_ConcurrentDecayIsAppliedOnlyOnce(t *testing.T) {
 	if risk != 25 {
 		t.Errorf("risk = %d after %d concurrent decay-only applies, want 25 "+
 			"(one half-life of 50). Decay was applied more than once.", risk, n)
+	}
+}
+
+// The reason risk_updated_at exists as its own column.
+//
+// updated_at moves on every write to the row, for any reason. If decay were
+// measured from it, the first feature that touched a session per request — a
+// last_seen_at, a counter — would silently reduce every elapsed time to zero,
+// decay would stop happening, and risk scores would only ever climb until every
+// active user crossed the Blocked threshold. Nothing would fail; the capability
+// package's own decay tests are pure and would stay green.
+//
+// Revert Apply to decay from updated_at and this test fails.
+func TestApply_DecaysFromRiskBaselineNotLastWrite(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+
+	// 50 points of risk banked a half-life ago...
+	sess := seedSession(t, pool, ctx, "baseline", 0, 50, 30*time.Minute)
+
+	// ...then something unrelated writes to the row, which the trigger stamps
+	// onto updated_at while leaving risk_updated_at alone.
+	if _, err := pool.Exec(ctx,
+		`UPDATE session_states SET agent_id = 'agent-1' WHERE session_id = $1`, sess.ID); err != nil {
+		t.Fatalf("unrelated write: %v", err)
+	}
+
+	var updatedAt, riskAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT updated_at, risk_updated_at FROM session_states WHERE session_id = $1`, sess.ID,
+	).Scan(&updatedAt, &riskAt); err != nil {
+		t.Fatalf("reading timestamps: %v", err)
+	}
+	if !updatedAt.After(riskAt) {
+		t.Fatalf("setup failed: updated_at %s should be newer than risk_updated_at %s", updatedAt, riskAt)
+	}
+
+	got, err := s.Apply(ctx, sess, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierFull, SignalDelta: 0,
+	}, nil)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got.RiskScore != 25 {
+		t.Errorf("risk = %d, want 25: decay was measured from the last write "+
+			"rather than from the risk baseline", got.RiskScore)
 	}
 }
