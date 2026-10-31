@@ -12,6 +12,7 @@ import (
 
 	"openclaw/guard/overseer/internal/auth"
 	"openclaw/guard/overseer/internal/capability"
+	"openclaw/guard/overseer/internal/inspect"
 	"openclaw/guard/overseer/internal/session"
 )
 
@@ -37,8 +38,9 @@ type Deps struct {
 	Upstream *Upstream
 	Log      *slog.Logger
 
-	// Inspectors run on every inbound request. Empty in phase 3.
-	Inspectors []Inspector
+	// Inspectors run on every inbound request, each with the authority its
+	// Mode grants. Empty until phase 4 supplies implementations.
+	Inspectors []inspect.Registered
 
 	// InspectBudget covers the whole inspection phase, not each inspector.
 	InspectBudget time.Duration
@@ -135,8 +137,8 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(HeaderSessionID, sess.ID.String())
 	log = log.With("session_id", sess.ID, "stored_tier", sess.Tier.String(), "risk", sess.RiskScore)
 
-	outcome := RunInspectors(r.Context(), g.d.InspectBudget, g.d.UnavailableFloor,
-		Subject{
+	outcome := inspect.RunInspectors(r.Context(), g.d.InspectBudget, g.d.UnavailableFloor,
+		inspect.Subject{
 			SessionID: sess.ID,
 			RequestID: requestID,
 			Direction: session.Inbound,

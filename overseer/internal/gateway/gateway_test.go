@@ -17,6 +17,7 @@ import (
 	"openclaw/guard/overseer/internal/auth"
 	"openclaw/guard/overseer/internal/capability"
 	"openclaw/guard/overseer/internal/dbtest"
+	"openclaw/guard/overseer/internal/inspect"
 	"openclaw/guard/overseer/internal/session"
 )
 
@@ -77,7 +78,7 @@ type harness struct {
 	user  auth.User
 }
 
-func newHarness(t *testing.T, inspectors ...Inspector) *harness {
+func newHarness(t *testing.T, inspectors ...inspect.Registered) *harness {
 	t.Helper()
 	pool, _ := dbtest.Pool(t)
 
@@ -269,7 +270,7 @@ func TestGateway_ReusesTheSessionAcrossRequests(t *testing.T) {
 // Criterion 10, part two: an unavailable inspector restricts the request but
 // must not be written to the session. Otherwise an outage follows the user.
 func TestGateway_InspectorFailureIsNotPersisted(t *testing.T) {
-	h := newHarness(t, StubInspector{InspectorName: "down", Err: errors.New("unreachable")})
+	h := newHarness(t, inspect.Enforcing(inspect.StubInspector{InspectorName: "down", Err: errors.New("unreachable")}))
 
 	w := h.post(t, simpleBody, nil)
 	if w.Code != http.StatusOK {
@@ -292,7 +293,7 @@ func TestGateway_InspectorFailureIsNotPersisted(t *testing.T) {
 
 // A blocked session never reaches the provider.
 func TestGateway_BlockedSessionNeverContactsUpstream(t *testing.T) {
-	h := newHarness(t, StubInspector{InspectorName: "down", Err: errors.New("unreachable")})
+	h := newHarness(t, inspect.Enforcing(inspect.StubInspector{InspectorName: "down", Err: errors.New("unreachable")}))
 	h.gw.d.UnavailableFloor = capability.TierBlocked
 
 	w := h.post(t, simpleBody, nil)
