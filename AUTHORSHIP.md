@@ -57,11 +57,12 @@ Inbound inspection is divided so the work is attributable.
 |---|---|
 | `inspect` seam move, per-inspector `Mode` | Assisted |
 | All test files in `internal/inspect` | Assisted |
-| `inspect.Hash`, `inspect.Preview`, `inspect.Redact` | Mine, reviewed |
+| `inspect.Hash`, `inspect.Redact` | Mine |
+| `inspect.Preview` — bounding and redaction rules | Assisted. I wrote the first version and got stuck on the redaction loop |
 | `inspect.ShannonEntropy` | Mine |
 | `inspect.SpikeRatio` | Mine |
 | `injectionRules`, `inspect.MatchesInjection` | Mine |
-| `Heuristics.Inspect` wiring | Mine, reviewed |
+| `Heuristics.Inspect` wiring | Mine |
 | Llama Guard response parser | Mine |
 | Ollama transport, violation recording path | Assisted |
 
@@ -71,3 +72,9 @@ where a subtle mistake fails open rather than loudly — are assisted.
 
 Each of my pieces was written against failing tests that specify the behaviour, one
 function at a time.
+
+Where review changed something, it is recorded rather than quietly folded in. The
+redaction rules in `Preview` are the clearest case: my first list included a `\w{8,}`
+pattern that would have masked every word of eight or more characters in every stored
+preview, and a ten-digit rule ordered before a sixteen-digit one, which would have left
+the last six digits of a card number exposed. Both were replaced.

@@ -1,7 +1,10 @@
 package inspect
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"regexp"
 	"time"
 )
 
@@ -47,31 +50,107 @@ type Redacted struct {
 //
 // redact_test.go is the specification.
 func Hash(content string) string {
-	return ""
+
+	data := []byte(content)
+	hash := sha256.Sum256(data)
+	hashString := hex.EncodeToString(hash[:])
+
+	return hashString
+}
+
+// redactionRules mask things that must not survive in a permanent record.
+//
+// Order matters: the list is applied in sequence, so a more specific pattern
+// has to come before a broader one that would eat part of its match. A
+// sixteen-digit card number redacted by a ten-digit rule first leaves six
+// digits exposed, which is worse than not matching at all.
+//
+// Every rule errs toward over-matching. A preview exists to recognise a pattern
+// later, not to reconstruct the input, so a redacted innocent string costs
+// legibility while a missed secret costs containment.
+//
+// Deliberately absent: a generic "long high-entropy blob" rule. Unrecognisable
+// density is the entropy inspector's job, and duplicating it here would mean
+// two places to tune and two places to be wrong.
+var redactionRules = []struct {
+	Name        string
+	Pattern     *regexp.Regexp
+	Replacement string
+}{
+	{
+		Name:        "email",
+		Pattern:     regexp.MustCompile(`(?i)\b[\w.+-]+@[\w-]+\.[\w.-]+\b`),
+		Replacement: "[redacted:email]",
+	},
+	{
+		// The token charset is wider than \w: real bearer tokens contain dots,
+		// dashes and slashes, and stopping at the first one leaves most of the
+		// secret in the record.
+		Name:        "bearer-token",
+		Pattern:     regexp.MustCompile(`(?i)\bbearer\s+[\w\-._~+/=]+`),
+		Replacement: "[redacted:token]",
+	},
+	{
+		// Recognisable key shapes: AWS access keys, sk-/pk- prefixed keys,
+		// GitHub tokens.
+		Name: "api-key",
+		Pattern: regexp.MustCompile(
+			`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|\b(?:sk|pk|rk)-[\w\-]{12,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b`),
+		Replacement: "[redacted:key]",
+	},
+	{
+		// A secret named by its assignment, whatever its shape.
+		Name: "secret-assignment",
+		Pattern: regexp.MustCompile(
+			`(?i)\b(?:api[_-]?key|secret|token|password|passwd|pwd|key)\b\s*[:=]\s*\S+`),
+		Replacement: "[redacted:secret]",
+	},
+	{
+		Name:        "ssn",
+		Pattern:     regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
+		Replacement: "[redacted:ssn]",
+	},
+	{
+		// Card-shaped runs, with or without separators. Before the generic
+		// digit rule so a card is never half-redacted.
+		Name:        "card-number",
+		Pattern:     regexp.MustCompile(`\b(?:\d[ -]?){12,18}\d\b`),
+		Replacement: "[redacted:card]",
+	},
+	{
+		// Phone and account numbers.
+		Name:        "long-digits",
+		Pattern:     regexp.MustCompile(`\b\d{9,}\b`),
+		Replacement: "[redacted:digits]",
+	},
 }
 
 // Preview returns a bounded, redacted rendering of content, safe to keep
 // indefinitely.
 //
-// TODO(jonah): yours.
+// Redaction runs before truncation on purpose. Truncating first could cut a
+// token in half and leave its first thirty characters sitting in the preview,
+// which is a partial secret rather than no secret.
 //
-// Two jobs:
-//
-//  1. Bound it. The result must never exceed PreviewMax runes. Truncate on a
-//     rune boundary, not a byte one, or a multi-byte character gets cut in half
-//     and the column holds invalid UTF-8. Mark a truncated preview so a reader
-//     can tell "this is all of it" from "there was more".
-//
-//  2. Redact it. Mask things that should not survive in a permanent record even
-//     in excerpt: email addresses, bearer tokens and API-key-shaped strings.
-//     Replace rather than delete — "[redacted]" tells a future reader something
-//     was there, which silence does not.
-//
-// Err on the side of masking. A preview is for recognising a pattern later, not
-// for reconstructing the input; over-redacting costs legibility, under-redacting
-// costs the containment the whole table is designed around.
+// A short preview is returned unchanged: the absence of a truncation marker
+// already says "this is all of it", and annotating it would mean the preview no
+// longer matches what was actually sent.
 func Preview(content string) string {
-	return ""
+	for _, rule := range redactionRules {
+		// ReplaceAllString is already a no-op when nothing matches, so there is
+		// nothing to test for first.
+		content = rule.Pattern.ReplaceAllString(content, rule.Replacement)
+	}
+
+	runes := []rune(content)
+	if len(runes) <= PreviewMax {
+		return content
+	}
+
+	// PreviewMax-1 so the ellipsis fits inside the budget rather than pushing
+	// the result one rune over it. The database enforces the same bound, so an
+	// off-by-one here is an insert error, not a cosmetic one.
+	return string(runes[:PreviewMax-1]) + "…"
 }
 
 // Redact assembles the durable record for one piece of content.
@@ -86,5 +165,20 @@ func Preview(content string) string {
 //
 // Raw must never be set without an expiry.
 func Redact(content string, capture bool, retention time.Duration, now time.Time) Redacted {
-	return Redacted{}
+
+	if capture {
+		raw := content
+		expiresAt := now.Add(retention)
+		return Redacted{
+			SHA256:    Hash(content),
+			Preview:   Preview(content),
+			Raw:       &raw,
+			ExpiresAt: &expiresAt,
+		}
+	} else {
+		return Redacted{
+			SHA256:  Hash(content),
+			Preview: Preview(content),
+		}
+	}
 }
