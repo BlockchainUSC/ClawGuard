@@ -48,6 +48,19 @@ type Deps struct {
 	// UnavailableFloor is applied when an inspector cannot answer. It restricts
 	// the request in hand and is never persisted.
 	UnavailableFloor capability.Tier
+
+	// EnforceDecisions controls whether a signal-driven demotion is persisted.
+	//
+	// False — the default — computes and logs the decision without calling
+	// session.Apply. The thresholds are placeholders until an evaluation corpus
+	// can say what the false-positive rate is, and a false positive restricts a
+	// real person, so detection ships before enforcement does.
+	//
+	// The zero value being "do not enforce" is the one place in this codebase
+	// where the permissive default is correct: enforcing with uncalibrated
+	// thresholds harms users, while not enforcing only delays protection that
+	// does not work yet.
+	EnforceDecisions bool
 }
 
 type Gateway struct{ d Deps }
@@ -68,6 +81,12 @@ func New(d Deps) (*Gateway, error) {
 	}
 	if d.InspectBudget <= 0 {
 		d.InspectBudget = 2 * time.Second
+	}
+	if d.Policy.Thresholds == (capability.Thresholds{}) {
+		// A zero Policy puts every threshold at zero, so TierFor returns
+		// TierBlocked for any score at all and every request is refused. That
+		// fails closed, but as a total outage with no explanation.
+		d.Policy = capability.DefaultPolicy()
 	}
 	if !d.UnavailableFloor.Valid() {
 		// Fail closed: an unset floor must not mean "no restriction".
@@ -143,13 +162,41 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 			RequestID: requestID,
 			Direction: session.Inbound,
 			Content:   req.LastUserText(),
+			Prior:     req.PriorUserText(),
 		},
 		g.d.Inspectors...)
 
-	// The floor restricts this request only. It is never handed to
-	// session.Apply, because "the guard is unavailable" is not evidence about
-	// the user and must not follow them to their next session.
-	effective := capability.EffectiveTier(sess.Tier, outcome.Floor)
+	// What the evidence says this session should be.
+	//
+	// cur is the STORED tier, never the effective one. The floor is scoped to
+	// this request, and feeding it back into a decision that later gets
+	// persisted would turn an inference outage into permanent evidence about
+	// the user — the failure that carrying risk rather than tier was meant to
+	// end.
+	//
+	// last is RiskUpdatedAt, not UpdatedAt. UpdatedAt moves on any write to the
+	// row, so decay measured from it is measured over the wrong interval.
+	decision := g.d.Policy.Decide(
+		sess.Tier,
+		sess.RiskScore,
+		sess.RiskUpdatedAt,
+		outcome.Signals,
+		time.Now(),
+	)
+
+	// With enforcement off the decision is computed and logged and changes
+	// nothing — not the stored tier, not this request. The thresholds are
+	// placeholders until an evaluation corpus can say what the false-positive
+	// rate is, and acting on them would restrict real people on the strength of
+	// numbers nobody has validated.
+	tier := sess.Tier
+	if g.d.EnforceDecisions {
+		tier = decision.To
+	}
+
+	// The floor applies either way. "The guard is unreachable" is a known bad
+	// state rather than an uncalibrated guess.
+	effective := capability.EffectiveTier(tier, outcome.Floor)
 	profile := capability.ProfileFor(effective)
 
 	log = log.With(
@@ -158,6 +205,18 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		"signals", len(outcome.Signals),
 		"tools_offered", len(req.Tools),
 	)
+	// Logged separately rather than folded into the request line: while
+	// enforcement is off this is the entire output of the inspection phase, and
+	// "would this have demoted someone, and did it actually" is the question
+	// the thresholds will be calibrated against.
+	log.Info("decision computed",
+		"decision_tier", decision.To.String(),
+		"risk_after", decision.RiskAfter,
+		"signal_delta", decision.SignalDelta,
+		"enforced", g.d.EnforceDecisions,
+		"reasons", decision.Reasons,
+	)
+
 	for _, res := range outcome.Results {
 		if res.Err != nil {
 			log.Warn("inspector unavailable",

@@ -41,7 +41,7 @@ var _ Store = (*PostgresStore)(nil)
 const carryForwardWindow = "24 hours"
 
 // sessionColumns is listed once so the SELECT and the Scan cannot drift apart.
-const sessionColumns = `session_id, user_id, current_tier, risk_score, created_at, updated_at`
+const sessionColumns = `session_id, user_id, current_tier, risk_score, created_at, updated_at, risk_updated_at`
 
 // LoadOrCreate implements Store.LoadOrCreate; see that interface for what the
 // behaviour is for. The comments below are about how it is achieved here.
@@ -102,7 +102,8 @@ func (s *PostgresStore) loadByID(ctx context.Context, id uuid.UUID, user auth.Us
 
 	err := s.pool.QueryRow(ctx,
 		`SELECT `+sessionColumns+` FROM session_states WHERE session_id = $1`, id,
-	).Scan(&sess.ID, &sess.UserID, &tier, &sess.RiskScore, &sess.CreatedAt, &sess.UpdatedAt)
+	).Scan(&sess.ID, &sess.UserID, &tier, &sess.RiskScore, &sess.CreatedAt, &sess.UpdatedAt,
+		&sess.RiskUpdatedAt)
 	if err != nil {
 		return Session{}, err
 	}
@@ -260,7 +261,7 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.
 		 RETURNING `+sessionColumns,
 		sess.ID, int(final), risk,
 	).Scan(&updated.ID, &updated.UserID, &updatedTier, &updated.RiskScore,
-		&updated.CreatedAt, &updated.UpdatedAt)
+		&updated.CreatedAt, &updated.UpdatedAt, &updated.RiskUpdatedAt)
 	if err != nil {
 		return Session{}, fmt.Errorf("updating session %s: %w", sess.ID, err)
 	}

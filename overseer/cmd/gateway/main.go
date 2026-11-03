@@ -27,6 +27,7 @@ import (
 	"openclaw/guard/overseer/internal/capability"
 	"openclaw/guard/overseer/internal/config"
 	"openclaw/guard/overseer/internal/gateway"
+	"openclaw/guard/overseer/internal/inspect"
 	"openclaw/guard/overseer/internal/session"
 )
 
@@ -76,6 +77,15 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("postgres unreachable: %w", err)
 	}
 
+	// Validated at startup rather than trusted. A zero-value Heuristics is not
+	// inert — every threshold at zero means "entropy >= 0" and "spike >= 0" are
+	// always true, so it fires on every request with weight zero: a noisy audit
+	// trail that changes nothing, with nothing reporting a fault.
+	heuristics := inspect.DefaultHeuristics()
+	if err := heuristics.Validate(); err != nil {
+		return err
+	}
+
 	g, err := gateway.New(gateway.Deps{
 		Auth:     authenticator,
 		Sessions: session.NewPostgresStore(pool),
@@ -86,9 +96,17 @@ func run(log *slog.Logger) error {
 			APIKey:  cfg.UpstreamAPIKey,
 			Client:  &http.Client{Timeout: cfg.UpstreamTimeout},
 		},
-		Log:           log,
-		Inspectors:    nil, // phase 4
+		Log: log,
+		Inspectors: []inspect.Registered{
+			inspect.Enforcing(heuristics),
+		},
 		InspectBudget: cfg.InspectTimeout,
+
+		// Detection ships before enforcement. The thresholds are placeholders
+		// until an evaluation corpus can say what the false-positive rate is,
+		// and a false positive restricts a real person. Decisions are computed
+		// and logged; nothing is persisted or acted on.
+		EnforceDecisions: false,
 		// An inspector that cannot answer quarantines the request in hand.
 		UnavailableFloor: capability.TierQuarantined,
 	})
@@ -108,7 +126,8 @@ func run(log *slog.Logger) error {
 			"addr", cfg.ListenAddr,
 			"upstream", cfg.UpstreamBaseURL,
 			"inspect_budget", cfg.InspectTimeout.String(),
-			"enforcement", "disabled (phase 3)")
+			"inspectors", 1,
+			"enforcement", "disabled: detection only until thresholds are calibrated")
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

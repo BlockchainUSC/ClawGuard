@@ -39,6 +39,18 @@ type Subject struct {
 	// outbound it is the assistant's reply.
 	Content string
 
+	// Prior is the earlier turns of this conversation, oldest first, as a
+	// baseline for Content.
+	//
+	// It exists because "this message is abnormally large" is only answerable
+	// relative to what normal looks like for this conversation, and the whole
+	// history is already in the request. Deriving the baseline from the request
+	// rather than from stored state is what keeps inspectors free of their own
+	// persistence: nothing to cache, nothing to expire, nothing to get stale.
+	//
+	// Empty is a valid answer and means "no baseline", not "no spike".
+	Prior []string
+
 	// ToolCalls is populated outbound only.
 	ToolCalls []ToolCall
 }

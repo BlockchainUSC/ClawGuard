@@ -2,10 +2,12 @@ package inspect
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"openclaw/guard/overseer/internal/capability"
 	"regexp"
 	"slices"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -52,6 +54,42 @@ func DefaultHeuristics() Heuristics {
 			capability.SourceTokenSpike: 10,
 		},
 	}
+}
+
+// Validate reports whether this Heuristics is usable.
+//
+// The zero value is not. With every threshold at zero, "entropy >= 0" and
+// "spike ratio >= 0" are both always true, so a zero-value Heuristics fires two
+// signals on every request — each with weight zero, because a nil Weights map
+// returns zero for any key. The result is a noisy audit trail that changes no
+// decision, with nothing anywhere reporting a problem.
+//
+// Call this at startup. A detector that silently does the wrong thing is worse
+// than one that refuses to start.
+func (h Heuristics) Validate() error {
+	var missing []string
+	if h.EntropyThreshold <= 0 {
+		missing = append(missing, "EntropyThreshold")
+	}
+	if h.EntropyMinLength <= 0 {
+		missing = append(missing, "EntropyMinLength")
+	}
+	if h.SpikeRatio <= 1 {
+		// A ratio of 1 or less means "every turn is a spike".
+		missing = append(missing, "SpikeRatio (must exceed 1)")
+	}
+	for _, src := range []capability.Source{
+		capability.SourceFastRegex, capability.SourceEntropy, capability.SourceTokenSpike,
+	} {
+		if h.Weights[src] <= 0 {
+			missing = append(missing, "Weights["+string(src)+"]")
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("heuristics misconfigured, these would detect nothing or everything: %s",
+			strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func (h Heuristics) Name() string {
@@ -106,7 +144,7 @@ func (h Heuristics) Inspect(ctx context.Context, s Subject) (Verdict, error) {
 			Code:       "entropy",
 		})
 	}
-	if SpikeRatio(nil, s.Content) >= h.SpikeRatio {
+	if SpikeRatio(s.Prior, s.Content) >= h.SpikeRatio {
 		signals = append(signals, capability.Signal{
 			Source:     capability.SourceTokenSpike,
 			Confidence: capability.ConfidenceLow,

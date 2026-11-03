@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"openclaw/guard/overseer/internal/auth"
 	"openclaw/guard/overseer/internal/capability"
@@ -75,7 +79,28 @@ type harness struct {
 	gw    *Gateway
 	rec   *recorder
 	store session.Store
+	pool  *pgxpool.Pool
 	user  auth.User
+	logs  *syncBuffer
+}
+
+// syncBuffer collects log output for assertions. The handler logs from the
+// request goroutine, so reads need the lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func newHarness(t *testing.T, inspectors ...inspect.Registered) *harness {
@@ -86,6 +111,7 @@ func newHarness(t *testing.T, inspectors ...inspect.Registered) *harness {
 	upstream := httptest.NewServer(rec.handler())
 	t.Cleanup(upstream.Close)
 
+	logs := &syncBuffer{}
 	user := auth.User{ID: "alice", Verified: true}
 	store := session.NewPostgresStore(pool)
 
@@ -101,7 +127,7 @@ func newHarness(t *testing.T, inspectors ...inspect.Registered) *harness {
 			APIKey:  "sk-gateway-secret",
 			Client:  &http.Client{Timeout: 10 * time.Second},
 		},
-		Log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:              slog.New(slog.NewJSONHandler(logs, nil)),
 		Inspectors:       inspectors,
 		InspectBudget:    500 * time.Millisecond,
 		UnavailableFloor: capability.TierQuarantined,
@@ -109,7 +135,7 @@ func newHarness(t *testing.T, inspectors ...inspect.Registered) *harness {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return &harness{gw: gw, rec: rec, store: store, user: user}
+	return &harness{gw: gw, rec: rec, store: store, pool: pool, user: user, logs: logs}
 }
 
 func (h *harness) post(t *testing.T, body string, hdr http.Header) *httptest.ResponseRecorder {
@@ -317,4 +343,222 @@ func jsonEqual(a, b any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return string(x) == string(y)
+}
+
+// ---------------------------------------------------------------------------
+// Wiring the inspectors into the request path.
+// ---------------------------------------------------------------------------
+
+// capturing records the Subject it was handed, so a test can assert what the
+// gateway actually passed down.
+type capturing struct {
+	mu   sync.Mutex
+	seen []inspect.Subject
+}
+
+func (c *capturing) Name() string { return "capturing" }
+
+func (c *capturing) Inspect(_ context.Context, s inspect.Subject) (inspect.Verdict, error) {
+	c.mu.Lock()
+	c.seen = append(c.seen, s)
+	c.mu.Unlock()
+	return inspect.Verdict{}, nil
+}
+
+func (c *capturing) last() (inspect.Subject, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.seen) == 0 {
+		return inspect.Subject{}, false
+	}
+	return c.seen[len(c.seen)-1], true
+}
+
+// The token-spike check needs a baseline, and the baseline is the conversation
+// already in the request. If the gateway does not pass the earlier turns, that
+// detector is inert no matter what anyone sends.
+func TestGateway_PassesConversationHistoryToInspectors(t *testing.T) {
+	cap := &capturing{}
+	h := newHarness(t, inspect.Enforcing(cap))
+
+	body := `{"model":"m","messages":[
+		{"role":"user","content":"first question"},
+		{"role":"assistant","content":"an answer"},
+		{"role":"user","content":"second question"},
+		{"role":"assistant","content":"another answer"},
+		{"role":"user","content":"the latest one"}]}`
+
+	if w := h.post(t, body, nil); w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+
+	got, ok := cap.last()
+	if !ok {
+		t.Fatal("the inspector was never called")
+	}
+	if got.Content != "the latest one" {
+		t.Errorf("Content = %q, want the most recent user turn", got.Content)
+	}
+	if len(got.Prior) != 2 {
+		t.Fatalf("Prior = %v, want the two earlier user turns", got.Prior)
+	}
+	if got.Prior[0] != "first question" || got.Prior[1] != "second question" {
+		t.Errorf("Prior = %v, want them oldest first", got.Prior)
+	}
+	if got.SessionID == uuid.Nil || got.RequestID == uuid.Nil {
+		t.Error("the Subject carries no session or request id")
+	}
+	if got.Direction != session.Inbound {
+		t.Errorf("Direction = %q, want INBOUND", got.Direction)
+	}
+}
+
+// Decay must be measured from risk_updated_at, not updated_at.
+//
+// This session has blocked-level risk earned ten hours ago, on a row written to
+// a moment ago. Decayed from the risk baseline it is spent and the request
+// proceeds; decayed from the last write it is untouched and the user is blocked
+// on risk that should have expired.
+func TestGateway_DecaysRiskFromTheRiskBaseline(t *testing.T) {
+	h := newHarness(t)
+	h.gw.d.EnforceDecisions = true
+
+	id := session.NewID()
+	if _, err := h.pool.Exec(t.Context(), `
+		INSERT INTO session_states
+			(session_id, user_id, current_tier, risk_score, created_at, updated_at, risk_updated_at)
+		VALUES ($1, $2, 0, 120, now() - interval '10 hours', now(), now() - interval '10 hours')`,
+		id, h.user.ID); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	hdr := http.Header{}
+	hdr.Set(HeaderSessionID, id.String())
+	w := h.post(t, simpleBody, hdr)
+
+	if calls, _, _ := h.rec.seen(); calls == 0 {
+		t.Error("the request was blocked on risk that should have decayed: " +
+			"decay is being measured from updated_at rather than risk_updated_at")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d", w.Code)
+	}
+}
+
+// With enforcement off, a detection must change nothing: not the stored tier,
+// and not this request either. The thresholds are placeholders, and acting on
+// them would restrict real people on numbers nobody has validated.
+func TestGateway_DetectionDoesNotEnforceWhenDisabled(t *testing.T) {
+	loud := inspect.StubInspector{
+		InspectorName: "loud",
+		Signals: []capability.Signal{{
+			Source: capability.SourceFastRegex, Weight: 500,
+			Confidence: capability.ConfidenceHigh, Code: "test",
+		}},
+	}
+	h := newHarness(t, inspect.Enforcing(loud))
+	h.gw.d.EnforceDecisions = false
+
+	w := h.post(t, simpleBody, nil)
+
+	if calls, _, _ := h.rec.seen(); calls != 1 {
+		t.Errorf("upstream calls = %d, want 1: a detection blocked a request with enforcement off", calls)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+	reloaded, err := h.store.LoadOrCreate(t.Context(), id, h.user)
+	if err != nil {
+		t.Fatalf("reloading: %v", err)
+	}
+	if reloaded.Tier != capability.TierFull {
+		t.Errorf("stored tier = %s, want %s: a detection was persisted with enforcement off",
+			reloaded.Tier, capability.TierFull)
+	}
+}
+
+// The floor is not a detection. "The guard is unreachable" is a known bad
+// state, so it restricts the request whatever EnforceDecisions says.
+func TestGateway_FloorAppliesEvenWithEnforcementDisabled(t *testing.T) {
+	down := inspect.StubInspector{InspectorName: "down", Err: errors.New("unreachable")}
+	h := newHarness(t, inspect.Enforcing(down))
+	h.gw.d.EnforceDecisions = false
+	h.gw.d.UnavailableFloor = capability.TierBlocked
+
+	w := h.post(t, simpleBody, nil)
+
+	if calls, _, _ := h.rec.seen(); calls != 0 {
+		t.Error("the floor did not restrict the request")
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d: a refusal is an answer, not an error", w.Code)
+	}
+}
+
+// decisionTierFromLogs pulls the tier out of the "decision computed" record.
+func decisionTierFromLogs(t *testing.T, raw string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec["msg"] == "decision computed" {
+			tier, _ := rec["decision_tier"].(string)
+			return tier
+		}
+	}
+	t.Fatalf("no \"decision computed\" record in the logs:\n%s", raw)
+	return ""
+}
+
+// The floor must never reach Policy.Decide.
+//
+// An unreachable inspector restricts the request in hand, but it is not
+// evidence about the user. Feeding it in as `cur` would make the decision
+// inherit it — and once enforcement is on, that decision is persisted and the
+// outage becomes a permanent fact about someone who did nothing. That is the
+// failure carrying risk rather than tier was meant to end.
+//
+// It is invisible in the response, because the floor produces the same
+// restriction either way. The decision itself is the only place the difference
+// shows, so this reads it from the log.
+func TestGateway_FloorDoesNotContaminateTheDecision(t *testing.T) {
+	down := inspect.StubInspector{InspectorName: "down", Err: errors.New("unreachable")}
+	h := newHarness(t, inspect.Enforcing(down))
+	h.gw.d.EnforceDecisions = true
+	h.gw.d.UnavailableFloor = capability.TierQuarantined
+
+	if w := h.post(t, simpleBody, nil); w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	if got := decisionTierFromLogs(t, h.logs.String()); got != capability.TierFull.String() {
+		t.Errorf("decision tier = %q, want %q: the availability floor was fed into Decide "+
+			"and would be persisted as evidence about the user",
+			got, capability.TierFull.String())
+	}
+}
+
+// The converse: a real detection does reach the decision.
+func TestGateway_SignalsReachTheDecision(t *testing.T) {
+	loud := inspect.StubInspector{
+		InspectorName: "loud",
+		Signals: []capability.Signal{{
+			Source: capability.SourceFastRegex, Weight: 500,
+			Confidence: capability.ConfidenceHigh, Code: "test",
+		}},
+	}
+	h := newHarness(t, inspect.Enforcing(loud))
+
+	if w := h.post(t, simpleBody, nil); w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+
+	if got := decisionTierFromLogs(t, h.logs.String()); got != capability.TierBlocked.String() {
+		t.Errorf("decision tier = %q, want %q: a weight-500 high-confidence signal "+
+			"did not reach Decide", got, capability.TierBlocked.String())
+	}
 }

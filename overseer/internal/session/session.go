@@ -31,7 +31,20 @@ type Session struct {
 	Tier      capability.Tier
 	RiskScore int
 	CreatedAt time.Time
+
+	// UpdatedAt is the last write of any kind, maintained by a trigger.
 	UpdatedAt time.Time
+
+	// RiskUpdatedAt is the last write of the risk score, and the baseline decay
+	// is measured from.
+	//
+	// Separate from UpdatedAt on purpose. A caller computing a decision needs
+	// to decay the stored score over the time since the score was last touched,
+	// not since the row was last touched by anything at all. Handing
+	// capability.Policy.Decide the wrong one measures decay over the wrong
+	// interval, which is the exact failure risk_updated_at was added to
+	// prevent.
+	RiskUpdatedAt time.Time
 
 	// IdentityVerified carries auth.User.Verified forward, so the audit trail
 	// records how much the identity behind this reputation was worth.

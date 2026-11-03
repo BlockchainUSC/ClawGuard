@@ -155,3 +155,82 @@ func TestStaticRefusal_ParsesAsAChatCompletion(t *testing.T) {
 		t.Errorf("finish_reason = %q", parsed.Choices[0].FinishReason)
 	}
 }
+
+// PriorUserText is the baseline for the token-spike check, so what it includes
+// decides whether that detector measures anything meaningful.
+func TestChatRequest_PriorUserText(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "earlier user turns, oldest first",
+			body: `{"messages":[
+				{"role":"user","content":"one"},
+				{"role":"assistant","content":"reply"},
+				{"role":"user","content":"two"},
+				{"role":"assistant","content":"reply"},
+				{"role":"user","content":"latest"}]}`,
+			want: []string{"one", "two"},
+		},
+		{
+			// The model's replies are not a baseline for the user's turns.
+			name: "assistant turns excluded",
+			body: `{"messages":[
+				{"role":"assistant","content":"a very long assistant message indeed"},
+				{"role":"user","content":"hi"}]}`,
+			want: nil,
+		},
+		{
+			name: "system prompts excluded",
+			body: `{"messages":[
+				{"role":"system","content":"you are a helpful assistant"},
+				{"role":"user","content":"hello"}]}`,
+			want: nil,
+		},
+		{
+			name: "first turn has no baseline",
+			body: `{"messages":[{"role":"user","content":"only message"}]}`,
+			want: nil,
+		},
+		{
+			name: "no messages at all",
+			body: `{"messages":[]}`,
+			want: nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var req ChatRequest
+			if err := json.Unmarshal([]byte(c.body), &req); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := req.PriorUserText()
+			if len(got) != len(c.want) {
+				t.Fatalf("PriorUserText() = %v, want %v", got, c.want)
+			}
+			for i := range got {
+				if got[i] != c.want[i] {
+					t.Errorf("PriorUserText()[%d] = %q, want %q", i, got[i], c.want[i])
+				}
+			}
+		})
+	}
+}
+
+// The latest turn is what Content carries; counting it in its own baseline
+// would compare a message against itself.
+func TestChatRequest_PriorExcludesTheLatestTurn(t *testing.T) {
+	var req ChatRequest
+	body := `{"messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatal(err)
+	}
+	prior := req.PriorUserText()
+	for _, p := range prior {
+		if p == req.LastUserText() {
+			t.Errorf("PriorUserText() contains the latest turn %q", p)
+		}
+	}
+}

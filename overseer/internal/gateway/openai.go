@@ -181,6 +181,34 @@ func (r ChatRequest) LastUserText() string {
 	return ""
 }
 
+// PriorUserText returns the user's earlier turns, oldest first, excluding the
+// most recent one.
+//
+// It is the baseline for "is this message unusually large". Only user turns
+// count: the question is how long this person's messages normally are, and
+// mixing in the model's replies would measure something else entirely. The
+// latest turn is excluded because it is the thing being compared.
+func (r ChatRequest) PriorUserText() []string {
+	latest := -1
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if r.Messages[i].Role == "user" {
+			latest = i
+			break
+		}
+	}
+	if latest <= 0 {
+		return nil
+	}
+
+	var out []string
+	for _, m := range r.Messages[:latest] {
+		if m.Role == "user" {
+			out = append(out, m.Text())
+		}
+	}
+	return out
+}
+
 // ToolNames lists the tools offered, in order.
 func (r ChatRequest) ToolNames() []string {
 	if len(r.Tools) == 0 {

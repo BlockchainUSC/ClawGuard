@@ -265,3 +265,105 @@ func TestHeuristics_NeverErrorsOnOrdinaryInput(t *testing.T) {
 		}
 	}
 }
+
+// --- Validate ---------------------------------------------------------------
+
+func TestHeuristics_DefaultIsValid(t *testing.T) {
+	if err := DefaultHeuristics().Validate(); err != nil {
+		t.Errorf("DefaultHeuristics is not usable: %v", err)
+	}
+}
+
+// The zero value fires on everything with weight zero: two signals per request
+// that change no decision, and nothing reporting a problem. It must not start.
+func TestHeuristics_ZeroValueIsRejected(t *testing.T) {
+	err := Heuristics{}.Validate()
+	if err == nil {
+		t.Fatal("a zero-value Heuristics was accepted")
+	}
+	for _, want := range []string{"EntropyThreshold", "EntropyMinLength", "SpikeRatio", "Weights"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %s", err, want)
+		}
+	}
+}
+
+func TestHeuristics_ValidateCatchesPartialConfig(t *testing.T) {
+	h := DefaultHeuristics()
+	h.Weights = map[capability.Source]int{capability.SourceFastRegex: 40} // entropy and spike missing
+	err := h.Validate()
+	if err == nil {
+		t.Fatal("a Heuristics missing two weights was accepted")
+	}
+	if !strings.Contains(err.Error(), string(capability.SourceEntropy)) {
+		t.Errorf("error %q does not name the missing entropy weight", err)
+	}
+}
+
+// A ratio of 1 or less means every turn counts as a spike.
+func TestHeuristics_ValidateRejectsDegenerateSpikeRatio(t *testing.T) {
+	for _, r := range []float64{0, 0.5, 1} {
+		h := DefaultHeuristics()
+		h.SpikeRatio = r
+		if err := h.Validate(); err == nil {
+			t.Errorf("SpikeRatio %v was accepted; every turn would be a spike", r)
+		}
+	}
+}
+
+// --- Subject.Prior ----------------------------------------------------------
+
+// The spike check is only meaningful with a baseline. Before Prior existed the
+// inspector passed nil and the branch could never fire, whatever the input.
+func TestHeuristics_SpikeFiresWithABaseline(t *testing.T) {
+	h := DefaultHeuristics()
+	s := Subject{
+		Prior:   []string{"hi", "ok", "thanks"},
+		Content: strings.Repeat("a", 200),
+	}
+	v, err := h.Inspect(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	var found bool
+	for _, sig := range v.Signals {
+		if sig.Source == capability.SourceTokenSpike {
+			found = true
+			if sig.Confidence != capability.ConfidenceLow {
+				t.Errorf("spike confidence = %v, want Low", sig.Confidence)
+			}
+		}
+	}
+	if !found {
+		t.Error("a 200-character turn against a 2-character baseline did not register as a spike")
+	}
+}
+
+func TestHeuristics_NoSpikeWhenTurnIsTypical(t *testing.T) {
+	v, err := DefaultHeuristics().Inspect(context.Background(), Subject{
+		Prior:   []string{"a typical question about something", "another one of about the same size"},
+		Content: "and a third question of a similar length",
+	})
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	for _, sig := range v.Signals {
+		if sig.Source == capability.SourceTokenSpike {
+			t.Errorf("an ordinary turn registered as a spike: %+v", sig)
+		}
+	}
+}
+
+func TestHeuristics_NoBaselineIsNotASpike(t *testing.T) {
+	v, err := DefaultHeuristics().Inspect(context.Background(), Subject{
+		Content: strings.Repeat("a", 5000), // first turn, nothing to compare against
+	})
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	for _, sig := range v.Signals {
+		if sig.Source == capability.SourceTokenSpike {
+			t.Errorf("the first turn of a conversation registered as a spike: %+v", sig)
+		}
+	}
+}
