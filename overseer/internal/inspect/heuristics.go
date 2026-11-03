@@ -2,9 +2,11 @@ package inspect
 
 import (
 	"context"
-	"regexp"
-
+	"math"
 	"openclaw/guard/overseer/internal/capability"
+	"regexp"
+	"slices"
+	"unicode/utf8"
 )
 
 // Heuristics is the in-process inspection layer: no network, no model, and fast
@@ -52,7 +54,9 @@ func DefaultHeuristics() Heuristics {
 	}
 }
 
-func (h Heuristics) Name() string { return string(capability.SourceFastRegex) }
+func (h Heuristics) Name() string {
+	return string(capability.SourceFastRegex)
+}
 
 // Inspect runs all three checks and returns whatever fired.
 //
@@ -85,7 +89,32 @@ func (h Heuristics) Name() string { return string(capability.SourceFastRegex) }
 //     run in-process and have nothing to fail at, so they should essentially
 //     never return an error.
 func (h Heuristics) Inspect(ctx context.Context, s Subject) (Verdict, error) {
-	return Verdict{}, ErrNotImplemented
+	signals := []capability.Signal{}
+	if name, ok := MatchesInjection(s.Content); ok {
+		signals = append(signals, capability.Signal{
+			Source:     capability.SourceFastRegex,
+			Confidence: capability.ConfidenceHigh,
+			Weight:     h.Weights[capability.SourceFastRegex],
+			Code:       name,
+		})
+	}
+	if len([]rune(s.Content)) >= h.EntropyMinLength && ShannonEntropy(s.Content) >= h.EntropyThreshold {
+		signals = append(signals, capability.Signal{
+			Source:     capability.SourceEntropy,
+			Confidence: capability.ConfidenceLow,
+			Weight:     h.Weights[capability.SourceEntropy],
+			Code:       "entropy",
+		})
+	}
+	if SpikeRatio(nil, s.Content) >= h.SpikeRatio {
+		signals = append(signals, capability.Signal{
+			Source:     capability.SourceTokenSpike,
+			Confidence: capability.ConfidenceLow,
+			Weight:     h.Weights[capability.SourceTokenSpike],
+			Code:       "token_spike",
+		})
+	}
+	return Verdict{signals}, nil
 }
 
 // ShannonEntropy returns the Shannon entropy of s in bits per rune.
@@ -106,7 +135,31 @@ func (h Heuristics) Inspect(ctx context.Context, s Subject) (Verdict, error) {
 // Count runes rather than bytes — a multi-byte character is one symbol, and
 // counting its bytes separately would inflate the score for any non-ASCII text.
 func ShannonEntropy(s string) float64 {
-	return 0
+
+	//Edge case 1: len(s) == 0
+	sLength := utf8.RuneCountInString(s) //len(s) doesn't always return the actual length of the string so utf.RuneCountInString(s) is implemented
+	if sLength == 0 {
+		return 0
+	}
+
+	runeMap := make(map[rune]int)
+	totalRunes := 0
+
+	//Create sum of runes in map
+	for _, r := range s {
+		runeMap[r]++
+		totalRunes++
+	}
+
+	var entropy float64
+	n := float64(totalRunes)
+
+	for _, count := range runeMap {
+		p := float64(count) / n
+		entropy -= p * math.Log2(p)
+	}
+
+	return entropy
 }
 
 // SpikeRatio reports how much larger latest is than a typical prior turn.
@@ -125,7 +178,21 @@ func ShannonEntropy(s string) float64 {
 // must not produce an infinity. Measure in runes, consistent with everything
 // else here.
 func SpikeRatio(prior []string, latest string) float64 {
-	return 1
+	if len(prior) == 0 || prior == nil {
+		return 1
+	}
+	latestLength := utf8.RuneCountInString(latest)
+
+	slices.Sort(prior) //maybe implement as BST so that I dont have to sort every time?
+	medianIndex := (len(prior) - 1) / 2
+
+	if prior[medianIndex] == "" {
+		return 1
+	}
+
+	spike := float64(latestLength) / float64(utf8.RuneCountInString(prior[medianIndex]))
+
+	return spike
 }
 
 // injectionRules are patterns that indicate an attempt to override the system
@@ -155,7 +222,28 @@ var injectionRules = []struct {
 	// TODO(jonah): populate. One entry, to show the shape:
 	{
 		Name:    "instruction-override",
-		Pattern: regexp.MustCompile(`(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions`),
+		Pattern: regexp.MustCompile(`(?i)(ignore|disregard)\s+(all\s+)?(previous|prior|above)\s+instructions`),
+	},
+	{
+		Name:    "role-reassignment",
+		Pattern: regexp.MustCompile(`(?i)you\s+are\s+now|pretend\s+you\s+are|act\s+as\s+(an?|the)\s+(\w+\s+)?(assistant|ai|model|chatbot|system|admin|administrator|hacker|dan)\b`),
+	},
+	{
+		Name:    "system-prompt-extraction",
+		Pattern: regexp.MustCompile(`(?i)repeat\s+your\s+instructions|what\s+is\s+your\s+system\s+prompt`),
+	},
+	{
+		Name:    "delimiter-injection",
+		Pattern: regexp.MustCompile(`(?i)###\s+system`),
+	},
+	{
+		Name:    "forget-instructions",
+		Pattern: regexp.MustCompile(`(?i)forget\s+your\s+instructions`),
+	},
+
+	{
+		Name:    "password-bypass",
+		Pattern: regexp.MustCompile(`(?i)(ignore|disregard)\s+((all|the)\s+)?(previous|prior|above)\s+`),
 	},
 }
 
@@ -165,5 +253,10 @@ var injectionRules = []struct {
 // match. The name matters: it goes into the violation row, and "something
 // matched" is useless at 3am compared with "instruction-override matched".
 func MatchesInjection(content string) (string, bool) {
+	for i, rule := range injectionRules {
+		if rule.Pattern.MatchString(content) {
+			return injectionRules[i].Name, true //returns the name of the rule that matched
+		}
+	}
 	return "", false
 }
