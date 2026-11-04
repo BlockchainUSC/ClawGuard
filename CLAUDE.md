@@ -9,9 +9,10 @@ inspects inbound prompts, computes a **capability tier** for the session, rewrit
 request to strip tools the session may no longer use, and inspects outbound tool calls and
 assistant text. Read `README.md` for the architecture before making design decisions.
 
-The security model (`internal/capability`), identity (`internal/auth`) and session persistence
-(`internal/session`) are built and tested. **The HTTP gateway itself does not exist yet**, so none
-of it is on a request path.
+The security model (`internal/capability`), identity (`internal/auth`), session persistence
+(`internal/session`) and the proxy itself (`internal/gateway`) are built and tested. The gateway
+**forwards every request unmodified** — the capability profile is computed and logged, but no tool
+is stripped, no model rerouted and no session demoted. Enforcement lands in phases 4-6.
 
 A second, asynchronous service — an LLM evaluator and an on-chain anchoring worker — was inherited
 from the multi-team project this was forked from and has been removed; see
@@ -107,6 +108,13 @@ Getting this wrong is the most common build break.
   `Decision.SignalDelta`**, never as one combined delta — decay applies once per elapsed period,
   signal weight once per evaluation, and conflating them let concurrent requests drain risk to
   zero.
+- `overseer/internal/gateway` — the proxy. Three things here are seams for later phases and should
+  not be "simplified" away: `ChatRequest` parses and re-serialises rather than copying bytes, so
+  phase 5 can rewrite `tools[]` without retrofitting parsing; `Inspector` returns signals or an
+  error and knows nothing about tiers, because mapping "could not answer" to a floor is a gateway
+  policy decision; and `RunInspectors` runs every leg concurrently under one shared budget, with
+  any failure producing `UnavailableFloor`. That floor is request-scoped and **never** passed to
+  `session.Apply`.
 - `overseer/internal/migrate` — migration runner. Records each file in `schema_migrations` and
   refuses to re-run one whose contents changed. **Never edit an applied migration; write the next
   one.** The schema tests live here too, since what they assert is what the migrations produce.

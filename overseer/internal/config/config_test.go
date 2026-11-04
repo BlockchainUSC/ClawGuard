@@ -7,14 +7,15 @@ import (
 
 func fullEnv() map[string]string {
 	return map[string]string{
-		EnvPostgresDSN:       "postgres://localhost/openclaw",
-		EnvAgentID:           "agent-1",
-		EnvOpenAIAPIKey:      "sk-test",
-		EnvAlchemyRPCURL:     "https://example.invalid/rpc",
-		EnvPrivateKey:        "0xabc",
-		EnvAuditLogAddress:   "0x0000000000000000000000000000000000000001",
-		EnvPunishmentAddress: "0x0000000000000000000000000000000000000002",
-		EnvLlamaGuardURL:     "http://localhost:8000",
+		EnvPostgresDSN:      "postgres://localhost/openclaw",
+		EnvListenAddr:       ":8080",
+		EnvUpstreamBaseURL:  "http://localhost:11434/v1",
+		EnvUpstreamAPIKey:   "sk-test",
+		EnvToolRegistryPath: "/etc/openclaw/tools.json",
+		EnvJWTIssuer:        "https://id.example.com",
+		EnvJWTAudience:      "openclaw-gateway",
+		EnvJWTPublicKeyPath: "/etc/openclaw/jwt.pub",
+		EnvLlamaGuardURL:    "http://localhost:8000",
 	}
 }
 
@@ -23,10 +24,9 @@ func fakeGetenv(env map[string]string) getenv {
 }
 
 var allRequirementSets = map[string][]string{
-	"seeder":   RequiredForSeeder,
-	"gateway":  RequiredForGateway,
-	"chain":    RequiredForChain,
-	"overseer": RequiredForOverseer,
+	"gateway":    RequiredForGateway,
+	"inspection": RequiredForInspection,
+	"migrate":    RequiredForMigrate,
 }
 
 func TestRequire_PassesWhenEverythingIsSet(t *testing.T) {
@@ -60,11 +60,11 @@ func TestRequire_NamesEachMissingVariable(t *testing.T) {
 
 // All of them at once should be reported together, not one per restart.
 func TestRequire_ReportsEveryMissingVariableAtOnce(t *testing.T) {
-	err := loadFrom(fakeGetenv(map[string]string{})).Require(RequiredForChain...)
+	err := loadFrom(fakeGetenv(map[string]string{})).Require(RequiredForGateway...)
 	if err == nil {
 		t.Fatal("empty environment produced no error")
 	}
-	for _, key := range RequiredForChain {
+	for _, key := range RequiredForGateway {
 		if !strings.Contains(err.Error(), key) {
 			t.Errorf("error %q omits %s", err, key)
 		}
@@ -87,10 +87,10 @@ func TestRequire_TreatsBlankAsMissing(t *testing.T) {
 
 func TestLoad_TrimsSurroundingWhitespace(t *testing.T) {
 	env := fullEnv()
-	env[EnvAgentID] = "  agent-1\n"
+	env[EnvJWTIssuer] = "  https://id.example.com\n"
 
-	if got := loadFrom(fakeGetenv(env)).AgentID; got != "agent-1" {
-		t.Errorf("AgentID = %q, want %q", got, "agent-1")
+	if got := loadFrom(fakeGetenv(env)).JWTIssuer; got != "https://id.example.com" {
+		t.Errorf("JWTIssuer = %q, want %q", got, "https://id.example.com")
 	}
 }
 

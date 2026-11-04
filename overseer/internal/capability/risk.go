@@ -2,6 +2,7 @@ package capability
 
 import (
 	"math"
+	"strconv"
 	"time"
 )
 
@@ -46,6 +47,22 @@ const (
 	ConfidenceLow
 	ConfidenceHigh
 )
+
+// String keeps Confidence legible once it reaches a JSON audit record. The
+// underlying type is an int, so without this a stored verdict reads "1" and the
+// reader has to go and look up which end of the enum that was.
+func (c Confidence) String() string {
+	switch c {
+	case ConfidenceUnspecified:
+		return "unspecified"
+	case ConfidenceLow:
+		return "low"
+	case ConfidenceHigh:
+		return "high"
+	default:
+		return "confidence(" + strconv.Itoa(int(c)) + ")"
+	}
+}
 
 // Signal is one piece of evidence produced by an inspection layer.
 type Signal struct {

@@ -103,7 +103,7 @@ the remedy for a false positive, and it is deliberately not reachable from the r
 
 ---
 
-## Inspection pipeline **[planned]**
+## Inspection pipeline **[partial]** — seam built, inspectors not
 
 ### Inbound
 
@@ -184,6 +184,8 @@ stops being achievable as soon as an `ALTER` is needed — see the hand-written 
 | `overseer/internal/dbtest` | **[built]** | Throwaway-schema harness for database tests |
 | `overseer/cmd/migrate` | **[built]** | Applies pending migrations; `-dry-run` gates a deploy |
 | `overseer/cmd/reset-user` | **[built]** | Clears a user's risk. The only path that lowers a tier |
+| `overseer/internal/gateway` | **[built]** | The reverse proxy: OpenAI-compatible wire types, the `Inspector` seam, tool-registry loading, tier-3 refusal |
+| `overseer/cmd/gateway` | **[built]** | Runs the proxy. Forwards unmodified — **enforcement is not wired yet** |
 | Gateway, heuristics, tool splicer | **[planned]** | Not started. Nothing above is on a request path yet |
 
 ---
@@ -216,11 +218,9 @@ Loaded from `.env` (gitignored).
    Pure and unit-testable, with no I/O.~~ **Done.**
 2. ~~**Identity and session storage** — JWT verification, session load/create with
    cross-session carry-forward, transactional decision writes under a row lock.~~ **Done.**
-3. **Gateway skeleton** — reverse proxy forwarding upstream unmodified, with session loading and
-   pass-through logging. Correct plumbing before any enforcement. Define the `Inspector` interface
-   here even though nothing implements it yet, so phase 4 plugs in rather than carves out.
-   **Next.**
-4. **Inbound inspection** — fast heuristics in-process, plus a Llama Guard 3 client, both legs in
+3. ~~**Gateway skeleton** — reverse proxy forwarding upstream unmodified, session loading,
+   the `Inspector` seam with a stub, tool-registry loading and the tier-3 refusal.~~ **Done.**
+4. **Inbound inspection** — fast heuristics in-process **(next)**, plus a Llama Guard 3 client, both legs in
    flight concurrently under a shared deadline. Timeout or outage applies a request-scoped floor
    (see `capability.EffectiveTier`), never a persisted demotion. Log-only until the latency budget
    is measured.

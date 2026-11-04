@@ -41,7 +41,7 @@ var _ Store = (*PostgresStore)(nil)
 const carryForwardWindow = "24 hours"
 
 // sessionColumns is listed once so the SELECT and the Scan cannot drift apart.
-const sessionColumns = `session_id, user_id, current_tier, risk_score, created_at, updated_at`
+const sessionColumns = `session_id, user_id, current_tier, risk_score, created_at, updated_at, risk_updated_at`
 
 // LoadOrCreate implements Store.LoadOrCreate; see that interface for what the
 // behaviour is for. The comments below are about how it is achieved here.
@@ -102,7 +102,8 @@ func (s *PostgresStore) loadByID(ctx context.Context, id uuid.UUID, user auth.Us
 
 	err := s.pool.QueryRow(ctx,
 		`SELECT `+sessionColumns+` FROM session_states WHERE session_id = $1`, id,
-	).Scan(&sess.ID, &sess.UserID, &tier, &sess.RiskScore, &sess.CreatedAt, &sess.UpdatedAt)
+	).Scan(&sess.ID, &sess.UserID, &tier, &sess.RiskScore, &sess.CreatedAt, &sess.UpdatedAt,
+		&sess.RiskUpdatedAt)
 	if err != nil {
 		return Session{}, err
 	}
@@ -260,7 +261,7 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.
 		 RETURNING `+sessionColumns,
 		sess.ID, int(final), risk,
 	).Scan(&updated.ID, &updated.UserID, &updatedTier, &updated.RiskScore,
-		&updated.CreatedAt, &updated.UpdatedAt)
+		&updated.CreatedAt, &updated.UpdatedAt, &updated.RiskUpdatedAt)
 	if err != nil {
 		return Session{}, fmt.Errorf("updating session %s: %w", sess.ID, err)
 	}
@@ -276,15 +277,13 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.
 	// claiming 0 -> 1 against a session already at 2 must not leave a row
 	// describing a demotion that never occurred.
 	for i, v := range vs {
-		_, err := tx.Exec(ctx, `
-			INSERT INTO guardrail_violations
-				(session_id, request_id, direction, violation_source, llama_guard_code,
-				 content_sha256, content_preview, raw_content,
-				 applied_downgrade_from, applied_downgrade_to, metadata)
-			VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11)`,
+		if err := checkViolation(v); err != nil {
+			return Session{}, fmt.Errorf("violation %d of %d: %w", i+1, len(vs), err)
+		}
+		_, err := tx.Exec(ctx, violationInsert,
 			sess.ID, requestID, string(v.Direction), string(v.Source), v.LlamaGuardCode,
-			v.ContentSHA256, v.ContentPreview, v.RawContent,
-			int(current), int(final), v.Metadata)
+			v.ContentSHA256, v.ContentPreview, v.RawContent, v.RawContentExpiresAt,
+			int(current), int(final), jsonParam(v.Metadata))
 		if err != nil {
 			// Returning here rolls back the tier change too, which is the whole
 			// reason for the transaction.
@@ -296,6 +295,72 @@ func (s *PostgresStore) Apply(ctx context.Context, sess Session, requestID uuid.
 		return Session{}, fmt.Errorf("commit for session %s: %w", sess.ID, err)
 	}
 	return updated, nil
+}
+
+// violationInsert is shared so the two write paths cannot drift. The two
+// downgrade columns are parameters rather than literals because Record leaves
+// them NULL: nothing was applied, and the column names say "applied".
+const violationInsert = `
+	INSERT INTO guardrail_violations
+		(session_id, request_id, direction, violation_source, llama_guard_code,
+		 content_sha256, content_preview, raw_content, raw_content_expires_at,
+		 applied_downgrade_from, applied_downgrade_to, metadata)
+	VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6, $7, $8, $9, $10, $11, $12)`
+
+// jsonParam hands metadata to a jsonb column.
+//
+// pgx encodes a Go []byte as binary, which Postgres then refuses to parse as
+// JSON. Passing the text form instead lets it parse normally, and nil becomes
+// SQL NULL rather than an empty string that is not valid JSON either.
+func jsonParam(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
+}
+
+// checkViolation rejects a row the schema would accept but that would be wrong
+// to keep.
+//
+// Raw content without an expiry is the one the database cannot catch: both
+// columns are nullable, so the pairing has to be enforced here or a capture run
+// leaves prompts in the table with no deadline and no sweep to remove them.
+func checkViolation(v Violation) error {
+	if v.RawContent != nil && v.RawContentExpiresAt == nil {
+		return fmt.Errorf("violation from %s carries raw content with no expiry", v.Source)
+	}
+	return nil
+}
+
+// Record writes evidence without touching the session. See Store.Record.
+func (s *PostgresStore) Record(ctx context.Context, sessionID, requestID uuid.UUID, vs []Violation) error {
+	if len(vs) == 0 {
+		return nil
+	}
+	for i, v := range vs {
+		if err := checkViolation(v); err != nil {
+			return fmt.Errorf("violation %d of %d: %w", i+1, len(vs), err)
+		}
+	}
+
+	// One transaction so a request's evidence lands whole. A half-recorded
+	// request is worse than an unrecorded one: it looks complete.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for i, v := range vs {
+		if _, err := tx.Exec(ctx, violationInsert,
+			sessionID, requestID, string(v.Direction), string(v.Source), v.LlamaGuardCode,
+			v.ContentSHA256, v.ContentPreview, v.RawContent, v.RawContentExpiresAt,
+			nil, nil, // nothing was applied
+			jsonParam(v.Metadata)); err != nil {
+			return fmt.Errorf("recording violation %d of %d: %w", i+1, len(vs), err)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // ResetUser clears risk and restores full capability for a user's sessions
