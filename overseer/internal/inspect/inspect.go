@@ -75,6 +75,14 @@ type Verdict struct {
 // that ignores cancellation holds a goroutine after the request has been
 // answered.
 type Inspector interface {
+	// Name identifies this inspector, and MUST be one of the
+	// capability.Source constants.
+	//
+	// It is not a label. Findings and failures are filed under it in
+	// guardrail_violations.violation_source, which carries a foreign key to the
+	// violation_sources table, so a free-form name is rejected at write time
+	// and the evidence for that request is lost. Adding an inspector means
+	// adding its Source constant and a row in that table, in a migration.
 	Name() string
 	Inspect(ctx context.Context, s Subject) (Verdict, error)
 }

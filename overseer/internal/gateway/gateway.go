@@ -61,6 +61,15 @@ type Deps struct {
 	// thresholds harms users, while not enforcing only delays protection that
 	// does not work yet.
 	EnforceDecisions bool
+
+	// CaptureRawContent stores the inspected text verbatim and records clean
+	// verdicts as well as findings. Both are needed to build an evaluation
+	// corpus; neither is wanted permanently.
+	CaptureRawContent bool
+
+	// RawContentRetention stamps an expiry on captured text. Raw content is
+	// never written without one.
+	RawContentRetention time.Duration
 }
 
 type Gateway struct{ d Deps }
@@ -216,6 +225,23 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		"enforced", g.d.EnforceDecisions,
 		"reasons", decision.Reasons,
 	)
+
+	// Recorded before the tier-3 early return below, or a blocked request —
+	// the most interesting kind — would leave no trace at all.
+	//
+	// A failure here does not fail the request. Nothing was enforced, so there
+	// is no safety reason to refuse the user because an audit write did not
+	// land. It is logged at error level instead, because silently losing
+	// evidence is how a corpus turns out to have holes months later.
+	redacted := redactFor(req.LastUserText(), g.d.CaptureRawContent, g.d.RawContentRetention)
+	if vs := violationsFrom(outcome, redacted, decision, sess.Tier,
+		g.d.EnforceDecisions, g.d.CaptureRawContent); len(vs) > 0 {
+		if err := g.d.Sessions.Record(r.Context(), sess.ID, requestID, vs); err != nil {
+			log.Error("recording evidence failed", "violations", len(vs), "err", err)
+		} else {
+			log.Info("evidence recorded", "violations", len(vs), "captured", g.d.CaptureRawContent)
+		}
+	}
 
 	for _, res := range outcome.Results {
 		if res.Err != nil {

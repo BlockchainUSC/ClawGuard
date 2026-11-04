@@ -36,6 +36,12 @@ const (
 	// from fields() and from the requirement sets: both have defaults.
 	EnvInspectTimeout  = "INSPECT_TIMEOUT"
 	EnvUpstreamTimeout = "UPSTREAM_TIMEOUT"
+
+	// Corpus capture. Off by default: storing prompts verbatim is a liability
+	// the rest of the schema is designed to avoid, and is only worth it while
+	// there is a corpus to label.
+	EnvCaptureRawContent   = "CAPTURE_RAW_CONTENT"
+	EnvRawContentRetention = "RAW_CONTENT_RETENTION"
 )
 
 // Defaults.
@@ -47,6 +53,10 @@ const (
 	defaultListenAddr      = ":8080"
 	defaultInspectTimeout  = 2 * time.Second
 	defaultUpstreamTimeout = 5 * time.Minute
+
+	// Short on purpose. Capture is a bounded exercise, and a retention window
+	// that outlives the labelling run quietly becomes permanent storage.
+	defaultRawContentRetention = 7 * 24 * time.Hour
 )
 
 // Requirement sets per component. A process requires only what it actually
@@ -98,6 +108,20 @@ type Config struct {
 	// inspector hold the request open.
 	InspectTimeout  time.Duration
 	UpstreamTimeout time.Duration
+
+	// CaptureRawContent stores the inspected text verbatim alongside its hash
+	// and preview, and records clean verdicts as well as findings.
+	//
+	// Both are needed to build an evaluation corpus and neither is wanted
+	// permanently: a false-positive rate cannot be computed from positives
+	// alone, and prompts kept forever make the audit log the system of record
+	// for the material it exists to catch. Turn it on for a labelling run,
+	// then off.
+	CaptureRawContent bool
+
+	// RawContentRetention is how long captured text survives. Nothing writes
+	// raw content without stamping an expiry from this.
+	RawContentRetention time.Duration
 }
 
 // getenv is swappable so tests can supply an environment without mutating the
@@ -166,8 +190,9 @@ func (c *Config) fields() map[string]*string {
 
 func loadFrom(get getenv) Config {
 	c := Config{
-		InspectTimeout:  defaultInspectTimeout,
-		UpstreamTimeout: defaultUpstreamTimeout,
+		InspectTimeout:      defaultInspectTimeout,
+		UpstreamTimeout:     defaultUpstreamTimeout,
+		RawContentRetention: defaultRawContentRetention,
 	}
 	for key, field := range c.fields() {
 		*field = strings.TrimSpace(get(key))
@@ -177,6 +202,15 @@ func loadFrom(get getenv) Config {
 	}
 	if d, err := time.ParseDuration(strings.TrimSpace(get(EnvUpstreamTimeout))); err == nil && d > 0 {
 		c.UpstreamTimeout = d
+	}
+	if d, err := time.ParseDuration(strings.TrimSpace(get(EnvRawContentRetention))); err == nil && d > 0 {
+		c.RawContentRetention = d
+	}
+	// Anything other than an explicit truthy value leaves capture off. A
+	// mistyped variable must not silently start storing prompts.
+	switch strings.ToLower(strings.TrimSpace(get(EnvCaptureRawContent))) {
+	case "1", "true", "yes", "on":
+		c.CaptureRawContent = true
 	}
 	if c.ListenAddr == "" {
 		c.ListenAddr = defaultListenAddr

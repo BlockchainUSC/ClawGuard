@@ -562,3 +562,206 @@ func TestGateway_SignalsReachTheDecision(t *testing.T) {
 			"did not reach Decide", got, capability.TierBlocked.String())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Recording evidence.
+// ---------------------------------------------------------------------------
+
+type violationRow struct {
+	Source   string
+	Raw      *string
+	Expiry   *time.Time
+	Metadata map[string]any
+}
+
+func (h *harness) violations(t *testing.T, sessionID uuid.UUID) []violationRow {
+	t.Helper()
+	rows, err := h.pool.Query(t.Context(), `
+		SELECT violation_source, raw_content, raw_content_expires_at, metadata
+		  FROM guardrail_violations WHERE session_id = $1 ORDER BY id`, sessionID)
+	if err != nil {
+		t.Fatalf("querying violations: %v", err)
+	}
+	defer rows.Close()
+
+	var out []violationRow
+	for rows.Next() {
+		var v violationRow
+		var meta []byte
+		if err := rows.Scan(&v.Source, &v.Raw, &v.Expiry, &meta); err != nil {
+			t.Fatalf("scanning: %v", err)
+		}
+		if len(meta) > 0 {
+			_ = json.Unmarshal(meta, &v.Metadata)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func loudInspector(name string, src capability.Source, weight int) inspect.StubInspector {
+	return inspect.StubInspector{
+		InspectorName: name,
+		Signals: []capability.Signal{{
+			Source: src, Weight: weight,
+			Confidence: capability.ConfidenceHigh, Code: "test-rule",
+		}},
+	}
+}
+
+// A detection is recorded even though enforcement is off. That record is the
+// entire output of this phase.
+func TestGateway_RecordsDetections(t *testing.T) {
+	h := newHarness(t, inspect.Enforcing(loudInspector(string(capability.SourceFastRegex), capability.SourceFastRegex, 40)))
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	rows := h.violations(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("violation rows = %d, want 1", len(rows))
+	}
+	if rows[0].Source != string(capability.SourceFastRegex) {
+		t.Errorf("source = %q", rows[0].Source)
+	}
+	if rows[0].Metadata["confidence"] != "high" {
+		t.Errorf("confidence = %v, want the string form", rows[0].Metadata["confidence"])
+	}
+	if rows[0].Metadata["enforced"] != false {
+		t.Errorf("enforced = %v, want false", rows[0].Metadata["enforced"])
+	}
+	// The counterfactual: the applied columns are NULL, so without this the
+	// record cannot say what would have happened.
+	if rows[0].Metadata["proposed_to"] == nil {
+		t.Error("the record does not say what the decision would have been")
+	}
+}
+
+// Shadow findings must be recorded and distinguishable, or comparing a
+// candidate detector against the incumbent is impossible.
+func TestGateway_RecordsShadowFindingsSeparately(t *testing.T) {
+	h := newHarness(t,
+		inspect.Enforcing(loudInspector(string(capability.SourceFastRegex), capability.SourceFastRegex, 40)),
+		inspect.Shadowing(loudInspector(string(capability.SourceLlamaGuard), capability.SourceLlamaGuard, 90)),
+	)
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	rows := h.violations(t, id)
+	if len(rows) != 2 {
+		t.Fatalf("violation rows = %d, want 2", len(rows))
+	}
+	modes := map[string]string{}
+	for _, r := range rows {
+		modes[r.Source], _ = r.Metadata["mode"].(string)
+	}
+	if modes[string(capability.SourceFastRegex)] != "enforce" {
+		t.Errorf("live inspector recorded as %q", modes[string(capability.SourceFastRegex)])
+	}
+	if modes[string(capability.SourceLlamaGuard)] != "shadow" {
+		t.Errorf("shadowed inspector recorded as %q: the two cannot be told apart",
+			modes[string(capability.SourceLlamaGuard)])
+	}
+}
+
+// An unreachable inspector is recorded, so a later reader can tell "no verdict
+// because the gate was down" from "no verdict because it was clean". Without
+// that distinction a corpus row is unusable.
+func TestGateway_RecordsInspectorFailures(t *testing.T) {
+	down := inspect.StubInspector{InspectorName: string(capability.SourceLlamaGuard), Err: errors.New("connection refused")}
+	h := newHarness(t, inspect.Enforcing(down))
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	rows := h.violations(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("violation rows = %d, want 1", len(rows))
+	}
+	if rows[0].Metadata["error"] == nil {
+		t.Error("the failure was recorded without saying what went wrong")
+	}
+}
+
+// With capture off, a clean request writes nothing. Three rows per request
+// forever is a permanent cost for a bounded exercise.
+func TestGateway_CleanRequestWritesNothingWithoutCapture(t *testing.T) {
+	h := newHarness(t, inspect.Enforcing(inspect.StubInspector{InspectorName: string(capability.SourceEntropy)}))
+	h.gw.d.CaptureRawContent = false
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	if rows := h.violations(t, id); len(rows) != 0 {
+		t.Errorf("%d rows written for a clean request with capture off", len(rows))
+	}
+}
+
+// With capture on, clean verdicts ARE recorded — a false-positive rate cannot
+// be computed from positives alone.
+func TestGateway_CaptureRecordsCleanVerdictsAndRawContent(t *testing.T) {
+	h := newHarness(t, inspect.Enforcing(inspect.StubInspector{InspectorName: string(capability.SourceEntropy)}))
+	h.gw.d.CaptureRawContent = true
+	h.gw.d.RawContentRetention = 48 * time.Hour
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	rows := h.violations(t, id)
+	if len(rows) != 1 {
+		t.Fatalf("violation rows = %d, want 1 clean verdict", len(rows))
+	}
+	if rows[0].Metadata["clean"] != true {
+		t.Errorf("metadata does not mark the verdict clean: %v", rows[0].Metadata)
+	}
+	if rows[0].Raw == nil {
+		t.Error("capture is on but no raw content was stored")
+	}
+	if rows[0].Expiry == nil {
+		t.Error("raw content stored with no expiry")
+	}
+}
+
+// A blocked request is the most interesting kind. Recording has to happen
+// before the tier-3 early return or it leaves no trace at all.
+func TestGateway_BlockedRequestStillRecords(t *testing.T) {
+	down := inspect.StubInspector{InspectorName: string(capability.SourceLlamaGuard), Err: errors.New("unreachable")}
+	h := newHarness(t, inspect.Enforcing(down))
+	h.gw.d.UnavailableFloor = capability.TierBlocked
+
+	w := h.post(t, simpleBody, nil)
+	if calls, _, _ := h.rec.seen(); calls != 0 {
+		t.Fatal("a blocked request reached upstream")
+	}
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	if rows := h.violations(t, id); len(rows) == 0 {
+		t.Error("a blocked request left no evidence behind")
+	}
+}
+
+// All of a turn's rows share one request_id, which is what makes "what did each
+// detector say about this prompt" answerable.
+func TestGateway_EvidenceSharesOneRequestID(t *testing.T) {
+	h := newHarness(t,
+		inspect.Enforcing(loudInspector(string(capability.SourceFastRegex), capability.SourceFastRegex, 10)),
+		inspect.Enforcing(loudInspector(string(capability.SourceEntropy), capability.SourceEntropy, 10)),
+	)
+
+	w := h.post(t, simpleBody, nil)
+	id := uuid.MustParse(w.Header().Get(HeaderSessionID))
+
+	var distinct int
+	if err := h.pool.QueryRow(t.Context(),
+		`SELECT count(DISTINCT request_id) FROM guardrail_violations WHERE session_id = $1`,
+		id).Scan(&distinct); err != nil {
+		t.Fatalf("counting: %v", err)
+	}
+	if distinct != 1 {
+		t.Errorf("distinct request_ids = %d, want 1", distinct)
+	}
+	if got := w.Header().Get(HeaderRequestID); got == "" {
+		t.Error("the response carries no request id to correlate with")
+	}
+}

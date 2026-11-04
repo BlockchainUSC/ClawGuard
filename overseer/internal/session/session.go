@@ -79,6 +79,14 @@ type Violation struct {
 	ContentPreview string
 	RawContent     *string
 
+	// RawContentExpiresAt must be set whenever RawContent is.
+	//
+	// Without it the retention sweep has nothing to find and the raw text lives
+	// forever, which is precisely the outcome the hash-and-preview split exists
+	// to avoid. The database cannot enforce the pairing without a constraint,
+	// so the write path checks it.
+	RawContentExpiresAt *time.Time
+
 	Metadata []byte // JSON, or nil
 }
 
@@ -91,6 +99,19 @@ type Store interface {
 	// recent tier recorded for the same user, which is what stops a demoted
 	// user from reconnecting into a clean slate.
 	LoadOrCreate(ctx context.Context, id uuid.UUID, user auth.User) (Session, error)
+
+	// Record writes evidence without touching the session.
+	//
+	// This is the log-only path. Apply would be wrong here: it also writes
+	// current_tier, risk_score and risk_updated_at, so using it to record an
+	// observation would reset the decay baseline on every request and keep
+	// bumping updated_at — which silently turns the carry-forward window from
+	// "demoted within 24h" into "active within 24h".
+	//
+	// applied_downgrade_from and _to are left NULL, because nothing was
+	// applied. What the decision would have been belongs in Metadata; those
+	// columns say "applied" and have to stay honest.
+	Record(ctx context.Context, sessionID, requestID uuid.UUID, vs []Violation) error
 
 	// Apply persists a decision and its evidence together, atomically, and
 	// returns the session as it now stands.

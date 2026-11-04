@@ -107,6 +107,12 @@ func run(log *slog.Logger) error {
 		// and a false positive restricts a real person. Decisions are computed
 		// and logged; nothing is persisted or acted on.
 		EnforceDecisions: false,
+
+		// Off unless explicitly enabled. Capture stores prompts verbatim and
+		// writes a row per inspector per request, which is the right trade only
+		// while a corpus is being built.
+		CaptureRawContent:   cfg.CaptureRawContent,
+		RawContentRetention: cfg.RawContentRetention,
 		// An inspector that cannot answer quarantines the request in hand.
 		UnavailableFloor: capability.TierQuarantined,
 	})
@@ -127,7 +133,8 @@ func run(log *slog.Logger) error {
 			"upstream", cfg.UpstreamBaseURL,
 			"inspect_budget", cfg.InspectTimeout.String(),
 			"inspectors", 1,
-			"enforcement", "disabled: detection only until thresholds are calibrated")
+			"enforcement", "disabled: detection only until thresholds are calibrated",
+			"capture", cfg.CaptureRawContent)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

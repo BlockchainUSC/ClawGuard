@@ -870,3 +870,213 @@ func TestApply_StillRatchetsWithinASession(t *testing.T) {
 		t.Errorf("tier = %s, want %s: the in-session ratchet was lost", got.Tier, capability.TierQuarantined)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Record: evidence without consequence.
+// ---------------------------------------------------------------------------
+
+func violationFixture() session.Violation {
+	return session.Violation{
+		Direction:      session.Inbound,
+		Source:         capability.SourceFastRegex,
+		ContentSHA256:  hash64('a'),
+		ContentPreview: "preview",
+	}
+}
+
+// Record writes evidence and leaves the session alone. Using Apply here would
+// reset risk_updated_at on every request, so decay would restart constantly and
+// effectively stop happening.
+func TestRecord_DoesNotTouchTheSession(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := seedSession(t, pool, ctx, "observed", int(capability.TierConstrained), 42, 30*time.Minute)
+
+	var beforeUpdated, beforeRisk time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT updated_at, risk_updated_at FROM session_states WHERE session_id = $1`, sess.ID,
+	).Scan(&beforeUpdated, &beforeRisk); err != nil {
+		t.Fatalf("reading timestamps: %v", err)
+	}
+
+	if err := s.Record(ctx, sess.ID, requestID(), []session.Violation{violationFixture()}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	var tier, risk int
+	var afterUpdated, afterRisk time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT current_tier, risk_score, updated_at, risk_updated_at
+		   FROM session_states WHERE session_id = $1`, sess.ID,
+	).Scan(&tier, &risk, &afterUpdated, &afterRisk); err != nil {
+		t.Fatalf("re-reading: %v", err)
+	}
+
+	if tier != int(capability.TierConstrained) || risk != 42 {
+		t.Errorf("Record changed the session: tier=%d risk=%d", tier, risk)
+	}
+	if !afterUpdated.Equal(beforeUpdated) {
+		t.Error("Record moved updated_at, which shifts the carry-forward window")
+	}
+	if !afterRisk.Equal(beforeRisk) {
+		t.Error("Record moved risk_updated_at, which restarts decay")
+	}
+}
+
+// Nothing was applied, so the columns that say "applied" must stay NULL.
+func TestRecord_LeavesAppliedDowngradeNull(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "null-downgrade")
+
+	if err := s.Record(ctx, sess.ID, requestID(), []session.Violation{violationFixture()}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	var from, to *int
+	if err := pool.QueryRow(ctx,
+		`SELECT applied_downgrade_from, applied_downgrade_to
+		   FROM guardrail_violations WHERE session_id = $1`, sess.ID).Scan(&from, &to); err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	if from != nil || to != nil {
+		t.Errorf("applied_downgrade = %v/%v, want NULL: nothing was applied", from, to)
+	}
+}
+
+// Raw content with no expiry is a leak with no deadline. Both columns are
+// nullable, so the database cannot catch the pairing and the write path must.
+func TestRecord_RejectsRawContentWithoutExpiry(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "no-expiry")
+
+	raw := "the original prompt"
+	v := violationFixture()
+	v.RawContent = &raw // deliberately no RawContentExpiresAt
+
+	err := s.Record(ctx, sess.ID, requestID(), []session.Violation{v})
+	if err == nil {
+		t.Fatal("raw content with no expiry was accepted")
+	}
+	if !strings.Contains(err.Error(), "expiry") {
+		t.Errorf("error %q does not explain the problem", err)
+	}
+
+	var n int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM guardrail_violations WHERE session_id = $1`, sess.ID).Scan(&n)
+	if n != 0 {
+		t.Errorf("%d rows written despite the rejection", n)
+	}
+}
+
+func TestRecord_StoresRawContentWithItsExpiry(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "captured")
+
+	raw := "the original prompt"
+	expiry := time.Now().Add(7 * 24 * time.Hour)
+	v := violationFixture()
+	v.RawContent = &raw
+	v.RawContentExpiresAt = &expiry
+
+	if err := s.Record(ctx, sess.ID, requestID(), []session.Violation{v}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	var gotRaw *string
+	var gotExpiry *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT raw_content, raw_content_expires_at FROM guardrail_violations WHERE session_id = $1`,
+		sess.ID).Scan(&gotRaw, &gotExpiry); err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	if gotRaw == nil || *gotRaw != raw {
+		t.Errorf("raw_content = %v, want %q", gotRaw, raw)
+	}
+	if gotExpiry == nil {
+		t.Fatal("raw content stored with no expiry: the retention sweep has nothing to find")
+	}
+}
+
+// Apply writes the expiry too. It previously dropped the column entirely, so
+// enforcement would have stored prompts that never expire.
+func TestApply_StoresRawContentExpiry(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "apply-captured")
+
+	raw := "prompt text"
+	expiry := time.Now().Add(time.Hour)
+	v := violationFixture()
+	v.RawContent = &raw
+	v.RawContentExpiresAt = &expiry
+
+	if _, err := s.Apply(ctx, sess, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierConstrained, SignalDelta: 40,
+	}, []session.Violation{v}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	var gotExpiry *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT raw_content_expires_at FROM guardrail_violations WHERE session_id = $1`,
+		sess.ID).Scan(&gotExpiry); err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	if gotExpiry == nil {
+		t.Error("Apply stored raw content with no expiry")
+	}
+}
+
+func TestApply_RejectsRawContentWithoutExpiry(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "apply-no-expiry")
+
+	raw := "prompt"
+	v := violationFixture()
+	v.RawContent = &raw
+
+	if _, err := s.Apply(ctx, sess, requestID(), capability.Decision{
+		From: capability.TierFull, To: capability.TierConstrained, SignalDelta: 40,
+	}, []session.Violation{v}); err == nil {
+		t.Error("Apply accepted raw content with no expiry")
+	}
+}
+
+// One request's evidence lands whole or not at all. A half-recorded request
+// looks complete and is worse than an unrecorded one.
+func TestRecord_IsAtomic(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "atomic")
+
+	good := violationFixture()
+	bad := violationFixture()
+	bad.Source = capability.Source("NOT_A_SOURCE") // violates the foreign key
+
+	if err := s.Record(ctx, sess.ID, requestID(),
+		[]session.Violation{good, bad}); err == nil {
+		t.Fatal("an invalid source was accepted")
+	}
+
+	var n int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM guardrail_violations WHERE session_id = $1`, sess.ID).Scan(&n)
+	if n != 0 {
+		t.Errorf("%d rows survived a failed batch", n)
+	}
+}
+
+func TestRecord_EmptySliceIsNotAnError(t *testing.T) {
+	pool, ctx := dbtest.Pool(t)
+	s := session.NewPostgresStore(pool)
+	sess := newSession(t, s, ctx, "empty")
+
+	if err := s.Record(ctx, sess.ID, requestID(), nil); err != nil {
+		t.Errorf("Record with no violations errored: %v", err)
+	}
+}

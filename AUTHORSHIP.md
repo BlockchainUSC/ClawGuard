@@ -64,7 +64,8 @@ Inbound inspection is divided so the work is attributable.
 | `injectionRules`, `inspect.MatchesInjection` | Mine |
 | `Heuristics.Inspect` wiring | Mine |
 | Llama Guard response parser | Mine |
-| Ollama transport, violation recording path | Assisted |
+| Ollama transport | Assisted |
+| Violation recording path, `Record`, capture flag | Assisted |
 
 The split is not arbitrary. Self-contained algorithms with clear inputs and outputs are
 mine. Mechanical refactors, transaction-touching code and security-critical wiring —
