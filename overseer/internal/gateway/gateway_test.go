@@ -399,11 +399,22 @@ func TestGateway_PassesConversationHistoryToInspectors(t *testing.T) {
 	if got.Content != "the latest one" {
 		t.Errorf("Content = %q, want the most recent user turn", got.Content)
 	}
-	if len(got.Prior) != 2 {
-		t.Fatalf("Prior = %v, want the two earlier user turns", got.Prior)
+	// The whole exchange reaches the inspector, roles intact: a classifier
+	// reading only the user's words cannot see an attack split across turns.
+	if len(got.Conversation) != 4 {
+		t.Fatalf("Conversation = %v, want the four turns before the latest", got.Conversation)
 	}
-	if got.Prior[0] != "first question" || got.Prior[1] != "second question" {
-		t.Errorf("Prior = %v, want them oldest first", got.Prior)
+	if got.Conversation[0].Role != "user" || got.Conversation[0].Text != "first question" {
+		t.Errorf("Conversation[0] = %+v, want the oldest user turn", got.Conversation[0])
+	}
+	if got.Conversation[1].Role != "assistant" {
+		t.Errorf("Conversation[1] = %+v, want the assistant reply kept", got.Conversation[1])
+	}
+
+	// The spike baseline is derived from it rather than carried separately.
+	prior := got.PriorUserText()
+	if len(prior) != 2 || prior[0] != "first question" || prior[1] != "second question" {
+		t.Errorf("PriorUserText() = %v, want the two earlier user turns", prior)
 	}
 	if got.SessionID == uuid.Nil || got.RequestID == uuid.Nil {
 		t.Error("the Subject carries no session or request id")

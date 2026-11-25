@@ -31,6 +31,7 @@ const (
 	EnvJWTAudience      = "JWT_AUDIENCE"
 	EnvJWTPublicKeyPath = "JWT_PUBLIC_KEY_PATH"
 	EnvLlamaGuardURL    = "LLAMA_GUARD_URL"
+	EnvLlamaGuardModel  = "LLAMA_GUARD_MODEL"
 
 	// Durations are parsed rather than stored as strings, so they are absent
 	// from fields() and from the requirement sets: both have defaults.
@@ -51,6 +52,7 @@ const (
 // far larger because a model writing a long answer is not a fault.
 const (
 	defaultListenAddr      = ":8080"
+	defaultLlamaGuardModel = "llama-guard3:8b"
 	defaultInspectTimeout  = 2 * time.Second
 	defaultUpstreamTimeout = 5 * time.Minute
 
@@ -101,6 +103,11 @@ type Config struct {
 
 	// Inspection (phase 4).
 	LlamaGuardURL string
+
+	// LlamaGuardModel is a config value rather than a constant so 8B and 1B can
+	// be compared on the same traffic once there is a corpus to compare them
+	// with.
+	LlamaGuardModel string
 
 	// Budgets. Separate on purpose: inspection must finish inside a tight
 	// deadline, while a model generating a long answer legitimately takes much
@@ -185,6 +192,7 @@ func (c *Config) fields() map[string]*string {
 		EnvJWTAudience:      &c.JWTAudience,
 		EnvJWTPublicKeyPath: &c.JWTPublicKeyPath,
 		EnvLlamaGuardURL:    &c.LlamaGuardURL,
+		EnvLlamaGuardModel:  &c.LlamaGuardModel,
 	}
 }
 
@@ -214,6 +222,9 @@ func loadFrom(get getenv) Config {
 	}
 	if c.ListenAddr == "" {
 		c.ListenAddr = defaultListenAddr
+	}
+	if c.LlamaGuardModel == "" {
+		c.LlamaGuardModel = defaultLlamaGuardModel
 	}
 	return c
 }

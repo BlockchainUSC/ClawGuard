@@ -318,8 +318,8 @@ func TestHeuristics_ValidateRejectsDegenerateSpikeRatio(t *testing.T) {
 func TestHeuristics_SpikeFiresWithABaseline(t *testing.T) {
 	h := DefaultHeuristics()
 	s := Subject{
-		Prior:   []string{"hi", "ok", "thanks"},
-		Content: strings.Repeat("a", 200),
+		Conversation: []Turn{{Role: "user", Text: "hi"}, {Role: "user", Text: "ok"}, {Role: "user", Text: "thanks"}},
+		Content:      strings.Repeat("a", 200),
 	}
 	v, err := h.Inspect(context.Background(), s)
 	if err != nil {
@@ -341,7 +341,10 @@ func TestHeuristics_SpikeFiresWithABaseline(t *testing.T) {
 
 func TestHeuristics_NoSpikeWhenTurnIsTypical(t *testing.T) {
 	v, err := DefaultHeuristics().Inspect(context.Background(), Subject{
-		Prior:   []string{"a typical question about something", "another one of about the same size"},
+		Conversation: []Turn{
+			{Role: "user", Text: "a typical question about something"},
+			{Role: "user", Text: "another one of about the same size"},
+		},
 		Content: "and a third question of a similar length",
 	})
 	if err != nil {

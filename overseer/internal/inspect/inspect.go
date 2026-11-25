@@ -29,6 +29,12 @@ type ToolCall struct {
 	Arguments string
 }
 
+// Turn is one message in a conversation.
+type Turn struct {
+	Role string // "user", "assistant", "system"
+	Text string
+}
+
 // Subject is the thing being inspected: one direction of one turn.
 type Subject struct {
 	SessionID uuid.UUID
@@ -39,21 +45,43 @@ type Subject struct {
 	// outbound it is the assistant's reply.
 	Content string
 
-	// Prior is the earlier turns of this conversation, oldest first, as a
-	// baseline for Content.
+	// Conversation is the exchange so far, oldest first, excluding Content.
 	//
-	// It exists because "this message is abnormally large" is only answerable
-	// relative to what normal looks like for this conversation, and the whole
-	// history is already in the request. Deriving the baseline from the request
-	// rather than from stored state is what keeps inspectors free of their own
-	// persistence: nothing to cache, nothing to expire, nothing to get stale.
+	// Roles are kept because context changes the verdict: a classifier reading
+	// only the user's words cannot see an attack split across turns, and an
+	// instruction that looks innocent alone can be the second half of one that
+	// was not. Deriving everything from the request rather than from stored
+	// state is what keeps inspectors free of their own persistence — nothing to
+	// cache, nothing to expire, nothing to get stale.
 	//
-	// Empty is a valid answer and means "no baseline", not "no spike".
-	Prior []string
+	// Empty is a valid answer and means "first turn", not "no history".
+	Conversation []Turn
 
 	// ToolCalls is populated outbound only.
 	ToolCalls []ToolCall
 }
+
+// PriorUserText returns the user's earlier turns, oldest first.
+//
+// Derived rather than carried as its own field, so there is one source of
+// truth. Two fields that must agree are two fields that can disagree.
+//
+// Only user turns: "is this message unusually large" is a question about how
+// long this person's messages normally are, and the model's replies measure
+// something else.
+func (s Subject) PriorUserText() []string {
+	var out []string
+	for _, t := range s.Conversation {
+		if t.Role == "user" {
+			out = append(out, t.Text)
+		}
+	}
+	return out
+}
+
+// directionOutbound mirrors session.Outbound without importing it for a
+// constant; inspect already depends on session for the Direction type.
+const directionOutbound = session.Outbound
 
 // Verdict is what one inspector concluded.
 //

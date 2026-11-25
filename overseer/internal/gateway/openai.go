@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"openclaw/guard/overseer/internal/inspect"
 )
 
 // ChatRequest is an OpenAI-compatible chat completion request.
@@ -205,6 +207,31 @@ func (r ChatRequest) PriorUserText() []string {
 		if m.Role == "user" {
 			out = append(out, m.Text())
 		}
+	}
+	return out
+}
+
+// ConversationBefore returns every turn preceding the latest user message,
+// oldest first, with roles intact.
+//
+// The latest user turn is excluded because it is the thing being judged; this
+// is the context it is judged against. Roles are kept because a classifier
+// reading only the user's words cannot see an attack spread across turns.
+func (r ChatRequest) ConversationBefore() []inspect.Turn {
+	latest := -1
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		if r.Messages[i].Role == "user" {
+			latest = i
+			break
+		}
+	}
+	if latest <= 0 {
+		return nil
+	}
+
+	out := make([]inspect.Turn, 0, latest)
+	for _, m := range r.Messages[:latest] {
+		out = append(out, inspect.Turn{Role: m.Role, Text: m.Text()})
 	}
 	return out
 }

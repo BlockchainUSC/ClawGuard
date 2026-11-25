@@ -144,7 +144,7 @@ func (h Heuristics) Inspect(ctx context.Context, s Subject) (Verdict, error) {
 			Code:       "entropy",
 		})
 	}
-	if SpikeRatio(s.Prior, s.Content) >= h.SpikeRatio {
+	if SpikeRatio(s.PriorUserText(), s.Content) >= h.SpikeRatio {
 		signals = append(signals, capability.Signal{
 			Source:     capability.SourceTokenSpike,
 			Confidence: capability.ConfidenceLow,

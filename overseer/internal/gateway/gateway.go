@@ -167,11 +167,11 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	outcome := inspect.RunInspectors(r.Context(), g.d.InspectBudget, g.d.UnavailableFloor,
 		inspect.Subject{
-			SessionID: sess.ID,
-			RequestID: requestID,
-			Direction: session.Inbound,
-			Content:   req.LastUserText(),
-			Prior:     req.PriorUserText(),
+			SessionID:    sess.ID,
+			RequestID:    requestID,
+			Direction:    session.Inbound,
+			Content:      req.LastUserText(),
+			Conversation: req.ConversationBefore(),
 		},
 		g.d.Inspectors...)
 

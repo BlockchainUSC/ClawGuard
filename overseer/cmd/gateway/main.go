@@ -86,6 +86,36 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
+	// The semantic gate is registered only when a URL is configured, so the
+	// gateway runs without a model present. A guardrail whose every path needs
+	// a GPU does not get run.
+	inspectors := []inspect.Registered{inspect.Enforcing(heuristics)}
+	if cfg.LlamaGuardURL != "" {
+		guard := inspect.LlamaGuard{
+			BaseURL: cfg.LlamaGuardURL,
+			Model:   cfg.LlamaGuardModel,
+			Weight:  inspect.DefaultLlamaGuardWeight,
+			// Its own client: the inspection budget is enforced by the runner's
+			// context, and a transport-level timeout here would cut the request
+			// before that deadline could report it as a floor.
+			Client: &http.Client{},
+		}
+
+		// Load the model now, so the first user through the door is not the one
+		// who pays the cold-start cost and gets floored for it. Not fatal: an
+		// inference service that is not up yet is handled correctly at request
+		// time, as a floor.
+		warmCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		if err := guard.Warm(warmCtx); err != nil {
+			log.Warn("could not warm the semantic gate", "err", err)
+		} else {
+			log.Info("semantic gate warm", "model", cfg.LlamaGuardModel)
+		}
+		cancel()
+
+		inspectors = append(inspectors, inspect.Enforcing(guard))
+	}
+
 	g, err := gateway.New(gateway.Deps{
 		Auth:     authenticator,
 		Sessions: session.NewPostgresStore(pool),
@@ -96,10 +126,8 @@ func run(log *slog.Logger) error {
 			APIKey:  cfg.UpstreamAPIKey,
 			Client:  &http.Client{Timeout: cfg.UpstreamTimeout},
 		},
-		Log: log,
-		Inspectors: []inspect.Registered{
-			inspect.Enforcing(heuristics),
-		},
+		Log:           log,
+		Inspectors:    inspectors,
 		InspectBudget: cfg.InspectTimeout,
 
 		// Detection ships before enforcement. The thresholds are placeholders
@@ -132,7 +160,8 @@ func run(log *slog.Logger) error {
 			"addr", cfg.ListenAddr,
 			"upstream", cfg.UpstreamBaseURL,
 			"inspect_budget", cfg.InspectTimeout.String(),
-			"inspectors", 1,
+			"inspectors", len(inspectors),
+			"semantic_gate", cfg.LlamaGuardURL != "",
 			"enforcement", "disabled: detection only until thresholds are calibrated",
 			"capture", cfg.CaptureRawContent)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
